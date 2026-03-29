@@ -162,7 +162,13 @@ class ATSScanner:
             logger.info("Clicking New Scan button...")
             await page.wait_for_load_state("networkidle", timeout=10000)
             await page.screenshot(path="/tmp/dashboard.png")
-            logger.info("Screenshot saved to /tmp/dashboard.png")
+            html = await page.content()
+            logger.info(f"PAGE HTML SNIPPET: {html[2000:4000]}")
+            # Send screenshot to Telegram for debugging
+            if self._debug_chat_id:
+                import telegram
+                bot = telegram.Bot(token=os.environ.get("BOT_TOKEN", ""))
+                await bot.send_photo(chat_id=self._debug_chat_id, photo=open("/tmp/dashboard.png", "rb"), caption="Dashboard screenshot")
 
             # Try all known button selectors
             clicked = False
