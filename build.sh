@@ -7,6 +7,6 @@ pip install -r ats_bot/requirements.txt
 
 echo "🌐 Installing Playwright + Chromium..."
 playwright install chromium
-playwright install-deps chromium
+
 
 echo "✅ Build complete!"
