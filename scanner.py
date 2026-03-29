@@ -158,11 +158,38 @@ class ATSScanner:
                 timeout=20000
             )
 
-            # Open New Scan modal
+            # Open New Scan modal — try multiple selectors
             logger.info("Clicking New Scan button...")
-            await page.locator("button[name='New Scan']").click()
-            await asyncio.sleep(3)  # Wait for modal animation
-            logger.info("Modal should be open!")
+            await page.wait_for_load_state("networkidle", timeout=10000)
+            await page.screenshot(path="/tmp/dashboard.png")
+            logger.info("Screenshot saved to /tmp/dashboard.png")
+
+            # Try all known button selectors
+            clicked = False
+            for selector in [
+                "button[name='New Scan']",
+                "button:has-text('New Scan')",
+                "a:has-text('New Scan')",
+                "[data-testid='new-scan']",
+                "button.btn:has-text('Scan')",
+                "text=New Scan",
+            ]:
+                try:
+                    el = page.locator(selector).first
+                    if await el.is_visible(timeout=2000):
+                        await el.click()
+                        clicked = True
+                        logger.info(f"Clicked using selector: {selector}")
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
+                raise Exception("Could not find New Scan button — check /tmp/dashboard.png screenshot")
+
+            await asyncio.sleep(4)  # Wait for modal animation
+            await page.screenshot(path="/tmp/modal.png")
+            logger.info("Modal screenshot saved.")
 
             # Fill Job Description — first contenteditable div
             jd_box = page.locator('div[contenteditable="true"]').nth(0)
