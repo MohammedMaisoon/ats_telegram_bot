@@ -1,5 +1,5 @@
 """
-scanner.py — With debug mode to capture page HTML and screenshot
+scanner.py — Fixed for SkillSyncer's modal-based form
 """
 
 import os
@@ -101,89 +101,133 @@ class ATSScanner:
             await page.goto(f"{SKILLSYNCER_URL}/scanner", wait_until="networkidle")
             await asyncio.sleep(3)
 
-            # Save pre-fill screenshot
-            await page.screenshot(path="debug_before_fill.png", full_page=True)
+            # ── Step 1: Click "Score My Resume" to open the modal ──
+            logger.info("Clicking 'Score My Resume' button to open form...")
+            try:
+                await page.click('button:has-text("Score My Resume")', timeout=5000)
+                await asyncio.sleep(2)
+                logger.info("Clicked Score My Resume button")
+            except Exception as e:
+                logger.warning(f"Could not click Score My Resume: {e}")
 
-            # Get all textareas on page for debugging
+            # ── Step 2: Close any popup/modal that appeared first ──
+            # Sometimes there's a welcome modal — close it
+            try:
+                await page.click('button.close', timeout=2000)
+                await asyncio.sleep(1)
+                logger.info("Closed popup")
+            except:
+                pass
+
+            # ── Step 3: Check what textareas are visible now ──
             textareas = await page.eval_on_selector_all(
                 'textarea',
-                'els => els.map(e => ({id: e.id, name: e.name, placeholder: e.placeholder, class: e.className}))'
+                'els => els.map(e => ({id: e.id, name: e.name, placeholder: e.placeholder, class: e.className, visible: e.offsetParent !== null}))'
             )
-            logger.info(f"Textareas found: {json.dumps(textareas)}")
+            logger.info(f"Textareas after button click: {json.dumps(textareas)}")
 
-            # Fill resume
+            await page.screenshot(path="debug_after_button.png", full_page=True)
+
+            # ── Step 4: Fill resume textarea ──
             filled_resume = False
-            for sel in [
+            resume_selectors = [
                 'textarea[placeholder*="resume" i]',
+                'textarea[placeholder*="paste" i]',
                 'textarea[name*="resume" i]',
-                '#resume', 'textarea:first-of-type',
+                '#resume', '#resumeText', '#resume_text',
+                '.modal textarea:first-of-type',
+                'textarea:first-of-type',
                 'textarea',
-            ]:
+            ]
+            for sel in resume_selectors:
                 try:
-                    await page.fill(sel, resume_text, timeout=3000)
-                    logger.info(f"Resume filled: {sel}")
-                    filled_resume = True
-                    break
-                except: continue
+                    el = await page.query_selector(sel)
+                    if el:
+                        visible = await el.is_visible()
+                        if visible:
+                            await el.fill(resume_text)
+                            logger.info(f"Resume filled with: {sel}")
+                            filled_resume = True
+                            break
+                except:
+                    continue
+
+            if not filled_resume:
+                logger.warning("Could not fill resume!")
 
             await asyncio.sleep(1)
 
-            # Fill JD
+            # ── Step 5: Fill JD textarea ──
             filled_jd = False
-            for sel in [
+            jd_selectors = [
                 'textarea[placeholder*="job" i]',
+                'textarea[placeholder*="description" i]',
                 'textarea[name*="job" i]',
-                '#job_description', '#jobDescription',
-                'textarea:nth-of-type(2)', 'textarea:last-of-type',
-            ]:
+                '#job_description', '#jobDescription', '#jd',
+                '.modal textarea:last-of-type',
+                'textarea:nth-of-type(2)',
+                'textarea:last-of-type',
+            ]
+            for sel in jd_selectors:
                 try:
-                    await page.fill(sel, jd_text, timeout=3000)
-                    logger.info(f"JD filled: {sel}")
-                    filled_jd = True
-                    break
-                except: continue
+                    el = await page.query_selector(sel)
+                    if el:
+                        visible = await el.is_visible()
+                        if visible:
+                            await el.fill(jd_text)
+                            logger.info(f"JD filled with: {sel}")
+                            filled_jd = True
+                            break
+                except:
+                    continue
+
+            if not filled_jd:
+                logger.warning("Could not fill JD!")
 
             await asyncio.sleep(1)
+            await page.screenshot(path="debug_after_fill.png", full_page=True)
 
-            # Get all buttons for debugging
-            buttons = await page.eval_on_selector_all(
-                'button',
-                'els => els.map(e => ({text: e.textContent.trim(), type: e.type, class: e.className}))'
-            )
-            logger.info(f"Buttons found: {json.dumps(buttons)}")
-
-            # Click analyze button
-            for sel in [
-                'button:has-text("Analyze")', 'button:has-text("Scan")',
-                'button:has-text("Check")', 'button:has-text("Compare")',
-                'button:has-text("Submit")', 'button[type="submit"]',
-                '.analyze-btn', 'input[type="submit"]',
-            ]:
+            # ── Step 6: Submit the form ──
+            submit_selectors = [
+                'button[type="submit"]',
+                'button:has-text("Analyze")',
+                'button:has-text("Scan")',
+                'button:has-text("Check")',
+                'button:has-text("Score")',
+                'button:has-text("Submit")',
+                'input[type="submit"]',
+            ]
+            for sel in submit_selectors:
                 try:
-                    await page.click(sel, timeout=3000)
-                    logger.info(f"Clicked button: {sel}")
-                    break
-                except: continue
+                    el = await page.query_selector(sel)
+                    if el:
+                        visible = await el.is_visible()
+                        if visible:
+                            await el.click()
+                            logger.info(f"Clicked submit: {sel}")
+                            break
+                except:
+                    continue
 
-            # Wait for results
-            await asyncio.sleep(10)
+            # ── Step 7: Wait for results ──
+            logger.info("Waiting for results...")
+            await asyncio.sleep(15)
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(3)
 
-            # Save post-result screenshot
-            await page.screenshot(path="debug_after_scan.png", full_page=True)
+            await page.screenshot(path="debug_results.png", full_page=True)
 
-            # Dump full page HTML for debugging
+            # Save HTML for inspection
             html = await page.content()
             with open("debug_page.html", "w") as f:
                 f.write(html)
-            logger.info(f"Page HTML saved ({len(html)} chars)")
+            logger.info(f"Results page HTML saved ({len(html)} chars)")
 
-            # Try many selectors for score
+            # ── Step 8: Extract score and keywords ──
             score = await self._extract_score(page)
             matched, missing = await self._extract_keywords(page)
 
-            logger.info(f"Score={score}, matched={len(matched)}, missing={len(missing)}")
+            logger.info(f"Final: Score={score}, matched={len(matched)}, missing={len(missing)}")
             return {"score": score, "matched_keywords": matched, "missing_keywords": missing}
 
         except Exception as e:
@@ -193,71 +237,67 @@ class ATSScanner:
             return {"error": str(e)}
 
     async def _extract_score(self, page):
-        # Try many possible selectors
-        selectors = [
-            '.score', '.score-circle', '.score-value', '.ats-score',
-            '.match-score', '.percentage', '.job-match-score',
-            '[class*="score"]', '[class*="match"]', '[class*="percent"]',
-            'h1', 'h2', 'h3', 'h4',
-            'span:has-text("%")', 'div:has-text("%")', 'p:has-text("%")',
+        # Try specific score selectors first
+        specific_selectors = [
+            '.score-circle', '.score-value', '.ats-score',
+            '.match-score', '.job-match', '.result-score',
+            '[class*="score"]', '[class*="result"]', '[class*="match"]',
+            'h1', 'h2', 'h3',
         ]
-        for sel in selectors:
+        for sel in specific_selectors:
             try:
                 elements = await page.query_selector_all(sel)
                 for el in elements:
-                    text = await el.inner_text()
-                    numbers = re.findall(r'\b(\d{1,3})\b', text)
-                    for num in numbers:
-                        if 1 <= int(num) <= 100 and '%' in text:
-                            logger.info(f"Score found via '{sel}': {num}")
-                            return num
-            except: continue
+                    if await el.is_visible():
+                        text = await el.inner_text()
+                        text = text.strip()
+                        if '%' in text:
+                            nums = re.findall(r'\b(\d{1,3})\b', text)
+                            for num in nums:
+                                if 1 <= int(num) <= 100:
+                                    logger.info(f"Score via '{sel}': {num}")
+                                    return num
+            except:
+                continue
 
-        # Last resort — scan all page text for % patterns
+        # Fallback: scan page text
         try:
             content = await page.content()
             matches = re.findall(r'(\d{1,3})%', content)
             valid = [m for m in matches if 1 <= int(m) <= 100]
             if valid:
-                logger.info(f"Score from page text: {valid[0]}")
+                logger.info(f"Score from page text: {valid[0]}, all found: {valid[:5]}")
                 return valid[0]
-        except: pass
+        except:
+            pass
 
         return "N/A"
 
     async def _extract_keywords(self, page):
         matched, missing = [], []
 
-        matched_selectors = [
-            '.matched-keyword', '.keyword-found', '.keyword.found',
-            '[class*="matched"]', '[class*="found"]', '.match',
-            '.skill-matched', '.present',
-        ]
-        missing_selectors = [
-            '.missing-keyword', '.keyword-missing', '.keyword.missing',
-            '[class*="missing"]', '.skill-missing', '.absent',
-        ]
-
-        for sel in matched_selectors:
+        for sel in ['.matched-keyword', '.keyword-found', '[class*="matched"]', '[class*="found"]', '.skill-matched']:
             try:
                 items = await page.eval_on_selector_all(
-                    sel, 'els => els.map(e => e.textContent.trim()).filter(t => t.length > 0 && t.length < 50)'
+                    sel, 'els => els.filter(e => e.offsetParent !== null).map(e => e.textContent.trim()).filter(t => t.length > 0 && t.length < 50)'
                 )
                 if items:
                     matched = items
-                    logger.info(f"Matched via '{sel}': {items[:5]}")
+                    logger.info(f"Matched keywords via '{sel}': {items[:5]}")
                     break
-            except: continue
+            except:
+                continue
 
-        for sel in missing_selectors:
+        for sel in ['.missing-keyword', '.keyword-missing', '[class*="missing"]', '.skill-missing']:
             try:
                 items = await page.eval_on_selector_all(
-                    sel, 'els => els.map(e => e.textContent.trim()).filter(t => t.length > 0 && t.length < 50)'
+                    sel, 'els => els.filter(e => e.offsetParent !== null).map(e => e.textContent.trim()).filter(t => t.length > 0 && t.length < 50)'
                 )
                 if items:
                     missing = items
-                    logger.info(f"Missing via '{sel}': {items[:5]}")
+                    logger.info(f"Missing keywords via '{sel}': {items[:5]}")
                     break
-            except: continue
+            except:
+                continue
 
         return matched[:20], missing[:20]
