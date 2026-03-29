@@ -193,16 +193,25 @@ class ATSScanner:
             await page.screenshot(path="/tmp/modal.png")
             logger.info("Modal screenshot saved.")
 
+            # Wait for contenteditable boxes to appear inside modal
+            logger.info("Waiting for JD input box...")
+            await page.wait_for_selector('div[contenteditable="true"]', timeout=15000)
+            await asyncio.sleep(1)
+
             # Fill Job Description — first contenteditable div
             jd_box = page.locator('div[contenteditable="true"]').nth(0)
+            await jd_box.scroll_into_view_if_needed()
             await jd_box.click()
-            await page.keyboard.type(jd_text, delay=10)
+            await asyncio.sleep(0.5)
+            await page.keyboard.type(jd_text, delay=5)
             logger.info("JD filled.")
 
             # Fill Resume — second contenteditable div
             resume_box = page.locator('div[contenteditable="true"]').nth(1)
+            await resume_box.scroll_into_view_if_needed()
             await resume_box.click()
-            await page.keyboard.type(resume_text, delay=10)
+            await asyncio.sleep(0.5)
+            await page.keyboard.type(resume_text, delay=5)
             logger.info("Resume filled.")
 
             # Click Scan
