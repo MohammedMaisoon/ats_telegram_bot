@@ -1,14 +1,14 @@
 """
 scanner.py — Playwright-based ATS scanner using SkillSyncer
-Runs headless Chromium, injects user cookies, extracts score silently
+Installs Chromium at runtime if not found
 """
 
 import os
 import json
 import asyncio
 import logging
-import shutil
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+import subprocess
+from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -16,25 +16,21 @@ MASTER_SESSION_FILE = "master_session.json"
 SKILLSYNCER_URL     = "https://skillsyncer.com"
 
 
-def get_chromium_executable():
-    """Find Chromium executable — try system paths first, then Playwright's."""
-    # System chromium (installed via nixpacks on Railway)
-    system_paths = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        shutil.which("google-chrome"),
-    ]
-    for path in system_paths:
-        if path and os.path.exists(path):
-            logger.info(f"Using system Chromium: {path}")
-            return path
-
-    logger.info("No system Chromium found — using Playwright's bundled Chromium")
-    return None  # Let Playwright use its own
+def ensure_chromium():
+    """Install Playwright Chromium at runtime if missing."""
+    try:
+        result = subprocess.run(
+            ["playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=120
+        )
+        logger.info(f"Playwright install: {result.stdout}")
+        # Also install deps
+        subprocess.run(
+            ["playwright", "install-deps", "chromium"],
+            capture_output=True, text=True, timeout=120
+        )
+    except Exception as e:
+        logger.error(f"Chromium install error: {e}")
 
 
 class ATSScanner:
@@ -46,10 +42,12 @@ class ATSScanner:
         cookies: list = None,
         user_id: int = None,
     ) -> dict:
-        async with async_playwright() as p:
-            executable = get_chromium_executable()
 
-            launch_args = dict(
+        # Install Chromium if not present
+        ensure_chromium()
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
@@ -59,10 +57,6 @@ class ATSScanner:
                     "--single-process",
                 ]
             )
-            if executable:
-                launch_args["executable_path"] = executable
-
-            browser = await p.chromium.launch(**launch_args)
 
             try:
                 if cookies:
@@ -74,7 +68,6 @@ class ATSScanner:
                         )
                     )
                     await context.add_cookies(cookies)
-                    logger.info(f"Using user cookies for {user_id}")
 
                 elif os.path.exists(MASTER_SESSION_FILE):
                     context = await browser.new_context(
@@ -88,12 +81,12 @@ class ATSScanner:
                     logger.info("Using master session")
 
                 else:
-                    logger.info("No master session found — logging in...")
+                    logger.info("No master session — logging in...")
                     context = await browser.new_context()
                     page = await context.new_page()
                     login_ok = await self._login_master(page)
                     if not login_ok:
-                        return {"error": "Master login failed"}
+                        return {"error": "Master login failed — check MASTER_EMAIL and MASTER_PASSWORD in Railway variables"}
                     await context.storage_state(path=MASTER_SESSION_FILE)
                     logger.info("Master session saved!")
 
@@ -103,12 +96,10 @@ class ATSScanner:
                 await asyncio.sleep(2)
 
                 if "login" in page.url or "signin" in page.url:
-                    logger.warning(f"Session expired for user {user_id}")
-                    # Delete stale session and retry with fresh login
                     if os.path.exists(MASTER_SESSION_FILE):
                         os.remove(MASTER_SESSION_FILE)
                     await browser.close()
-                    return {"error": "session_expired — please try again"}
+                    return {"error": "Session expired — please try again"}
 
                 result = await self._run_analysis(page, resume_text, jd_text)
                 await browser.close()
@@ -116,7 +107,10 @@ class ATSScanner:
 
             except Exception as e:
                 logger.error(f"Scanner error: {e}")
-                await browser.close()
+                try:
+                    await browser.close()
+                except:
+                    pass
                 return {"error": str(e)}
 
     async def _login_master(self, page) -> bool:
@@ -130,7 +124,6 @@ class ATSScanner:
         try:
             await page.goto(f"{SKILLSYNCER_URL}/login", wait_until="networkidle")
             await asyncio.sleep(1)
-
             await page.fill('input[type="email"], input[name="email"], #email', email)
             await asyncio.sleep(0.5)
             await page.fill('input[type="password"], input[name="password"], #password', password)
@@ -155,54 +148,43 @@ class ATSScanner:
             await page.goto(f"{SKILLSYNCER_URL}/scanner", wait_until="networkidle")
             await asyncio.sleep(2)
 
-            resume_selectors = [
+            for sel in [
                 'textarea[placeholder*="resume" i]',
                 'textarea[name*="resume" i]',
-                '#resume',
-                '.resume-input textarea',
-                'textarea:first-of-type',
-            ]
-            for sel in resume_selectors:
+                '#resume', '.resume-input textarea', 'textarea:first-of-type',
+            ]:
                 try:
                     await page.fill(sel, resume_text, timeout=3000)
-                    logger.info(f"Resume filled with selector: {sel}")
+                    logger.info(f"Resume filled: {sel}")
                     break
                 except:
                     continue
 
             await asyncio.sleep(1)
 
-            jd_selectors = [
+            for sel in [
                 'textarea[placeholder*="job" i]',
                 'textarea[name*="job" i]',
-                '#job_description',
-                '#jobDescription',
-                '.job-input textarea',
-                'textarea:last-of-type',
-                'textarea:nth-of-type(2)',
-            ]
-            for sel in jd_selectors:
+                '#job_description', '#jobDescription',
+                '.job-input textarea', 'textarea:last-of-type', 'textarea:nth-of-type(2)',
+            ]:
                 try:
                     await page.fill(sel, jd_text, timeout=3000)
-                    logger.info(f"JD filled with selector: {sel}")
+                    logger.info(f"JD filled: {sel}")
                     break
                 except:
                     continue
 
             await asyncio.sleep(1)
 
-            btn_selectors = [
-                'button:has-text("Analyze")',
-                'button:has-text("Scan")',
-                'button:has-text("Check")',
-                'button:has-text("Compare")',
-                'button[type="submit"]',
-                '.analyze-btn',
-            ]
-            for sel in btn_selectors:
+            for sel in [
+                'button:has-text("Analyze")', 'button:has-text("Scan")',
+                'button:has-text("Check")', 'button:has-text("Compare")',
+                'button[type="submit"]', '.analyze-btn',
+            ]:
                 try:
                     await page.click(sel, timeout=3000)
-                    logger.info(f"Clicked button: {sel}")
+                    logger.info(f"Clicked: {sel}")
                     break
                 except:
                     continue
@@ -213,12 +195,7 @@ class ATSScanner:
             score = await self._extract_score(page)
             matched, missing = await self._extract_keywords(page)
 
-            logger.info(f"Scan complete — Score: {score}")
-            return {
-                "score": score,
-                "matched_keywords": matched,
-                "missing_keywords": missing,
-            }
+            return {"score": score, "matched_keywords": matched, "missing_keywords": missing}
 
         except Exception as e:
             logger.error(f"Analysis error: {e}")
@@ -229,12 +206,11 @@ class ATSScanner:
             return {"error": str(e)}
 
     async def _extract_score(self, page) -> str:
-        score_selectors = [
+        for sel in [
             '.score-circle', '.score-value', '.ats-score',
             '[class*="score"]', '.match-score', '.percentage',
             'h2:has-text("%")', 'span:has-text("%")',
-        ]
-        for sel in score_selectors:
+        ]:
             try:
                 el = await page.query_selector(sel)
                 if el:
@@ -245,7 +221,6 @@ class ATSScanner:
                         return numbers[0]
             except:
                 continue
-
         try:
             import re
             content = await page.content()
@@ -254,13 +229,10 @@ class ATSScanner:
                 return matches[0]
         except:
             pass
-
         return "N/A"
 
     async def _extract_keywords(self, page):
-        matched = []
-        missing = []
-
+        matched, missing = [], []
         try:
             matched = await page.eval_on_selector_all(
                 '.matched-keyword, .keyword-found, [class*="matched"], .keyword.found',
@@ -268,7 +240,6 @@ class ATSScanner:
             )
         except:
             pass
-
         try:
             missing = await page.eval_on_selector_all(
                 '.missing-keyword, .keyword-missing, [class*="missing"], .keyword.missing',
@@ -276,5 +247,4 @@ class ATSScanner:
             )
         except:
             pass
-
         return matched[:20], missing[:20]
