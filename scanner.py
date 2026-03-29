@@ -160,20 +160,20 @@ class ATSScanner:
 
             # Open New Scan modal
             logger.info("Clicking New Scan button...")
-            await page.get_by_role("button", name="New Scan").click()
-            await page.get_by_role("heading", name="Create New Scan").wait_for(timeout=10000)
-            logger.info("Modal is open!")
+            await page.locator("button[name='New Scan']").click()
+            await asyncio.sleep(3)  # Wait for modal animation
+            logger.info("Modal should be open!")
 
             # Fill Job Description — first contenteditable div
             jd_box = page.locator('div[contenteditable="true"]').nth(0)
             await jd_box.click()
-            await jd_box.fill(jd_text)
+            await page.keyboard.type(jd_text, delay=10)
             logger.info("JD filled.")
 
             # Fill Resume — second contenteditable div
             resume_box = page.locator('div[contenteditable="true"]').nth(1)
             await resume_box.click()
-            await resume_box.fill(resume_text)
+            await page.keyboard.type(resume_text, delay=10)
             logger.info("Resume filled.")
 
             # Click Scan
