@@ -27,7 +27,6 @@ RUN apt-get update && apt-get install -y \
     libexpat1 \
     libxcb1 \
     libatspi2.0-0 \
-    libgdk-pixbuf2.0-0 \
     libgtk-3-0 \
     fonts-liberation \
     wget \
