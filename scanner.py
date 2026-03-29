@@ -124,6 +124,21 @@ class ATSScanner:
             idx = (self._account_index + i) % len(ACCOUNTS)
             account = ACCOUNTS[idx]
             logger.info(f"Trying account {idx+1}/{len(ACCOUNTS)}: {account['email']}")
+
+            # Fully reset browser + context before each attempt
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+
             ok = await self._login(account)
             if not ok:
                 continue
@@ -134,13 +149,6 @@ class ATSScanner:
                 return True
             else:
                 logger.warning(f"Account {account['email']} has 0 scans — trying next")
-                # close this context and try next
-                if self._context:
-                    try:
-                        await self._context.close()
-                    except Exception:
-                        pass
-                    self._context = None
         logger.error("All accounts exhausted — no scans available")
         return False
 
@@ -228,13 +236,22 @@ class ATSScanner:
             # If redirected to subscription page, this account has no scans — rotate
             if "subscription" in current_url:
                 logger.warning("Redirected to subscription — account out of scans, rotating...")
-                await page.close()
+                try:
+                    await page.close()
+                except Exception:
+                    pass
                 if self._context:
                     try:
                         await self._context.close()
                     except Exception:
                         pass
                     self._context = None
+                if self._browser:
+                    try:
+                        await self._browser.close()
+                    except Exception:
+                        pass
+                    self._browser = None
                 self._account_index = (self._account_index + 1) % len(ACCOUNTS)
                 ok = await self._login_next_account()
                 if not ok:
