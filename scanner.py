@@ -13,8 +13,17 @@ from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
-MASTER_EMAIL    = os.environ.get("MASTER_EMAIL", "")
-MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD", "")
+# Account pool — rotates when one runs out of scans
+_DEFAULT_PASSWORD = os.environ.get("MASTER_PASSWORD", "ski!!@123")
+ACCOUNTS = [
+    {"email": os.environ.get("MASTER_EMAIL", "maisoonmohammed23@gmail.com"), "password": _DEFAULT_PASSWORD},
+    {"email": "mohammedmaisoon24@gmail.com", "password": _DEFAULT_PASSWORD},
+    {"email": "mohammedmaisoon22@gmail.com", "password": _DEFAULT_PASSWORD},
+    {"email": "hmoideenbasha@gmail.com",     "password": _DEFAULT_PASSWORD},
+    {"email": "mdmaisoon23@gmail.com",       "password": _DEFAULT_PASSWORD},
+]
+MASTER_EMAIL    = ACCOUNTS[0]["email"]
+MASTER_PASSWORD = ACCOUNTS[0]["password"]
 
 # System Chromium installed by apt-get in Dockerfile
 CHROMIUM_PATHS = [
@@ -46,10 +55,11 @@ class ATSScanner:
     """
 
     def __init__(self):
-        self._playwright = None
-        self._browser    = None
-        self._context    = None
-        self._lock       = asyncio.Lock()
+        self._playwright    = None
+        self._browser       = None
+        self._context       = None
+        self._lock          = asyncio.Lock()
+        self._account_index = 0   # which account we are currently using
 
     async def _start_browser(self):
         if self._playwright is None:
@@ -74,7 +84,7 @@ class ATSScanner:
             self._browser = await self._playwright.chromium.launch(**launch_kwargs)
             logger.info("Browser launched successfully.")
 
-    async def _login(self):
+    async def _login(self, account=None):
         if self._context:
             try:
                 await self._context.close()
@@ -82,28 +92,57 @@ class ATSScanner:
                 pass
             self._context = None
 
+        if account is None:
+            account = ACCOUNTS[self._account_index]
+
         await self._start_browser()
         self._context = await self._browser.new_context()
         page = await self._context.new_page()
         try:
-            logger.info("Logging in to SkillSyncer...")
+            logger.info(f"Logging in as {account['email']}...")
             await page.goto(
                 "https://skillsyncer.com/login",
                 wait_until="domcontentloaded",
                 timeout=30000
             )
-            await page.get_by_role("textbox", name="you@mail.com").fill(MASTER_EMAIL)
-            await page.get_by_role("textbox", name="password").fill(MASTER_PASSWORD)
+            await page.get_by_role("textbox", name="you@mail.com").fill(account["email"])
+            await page.get_by_role("textbox", name="password").fill(account["password"])
             await page.get_by_role("button", name="Sign In").click()
             await page.wait_for_url("**/dashboard", timeout=20000)
-            logger.info("Master login successful!")
+            logger.info(f"Login successful: {account['email']}")
             return True
         except Exception as e:
-            logger.error(f"Login failed: {e}")
+            logger.error(f"Login failed for {account['email']}: {e}")
             self._context = None
             return False
         finally:
             await page.close()
+
+    async def _login_next_account(self):
+        """Try each account in the pool until one works and has scans."""
+        for i in range(len(ACCOUNTS)):
+            idx = (self._account_index + i) % len(ACCOUNTS)
+            account = ACCOUNTS[idx]
+            logger.info(f"Trying account {idx+1}/{len(ACCOUNTS)}: {account['email']}")
+            ok = await self._login(account)
+            if not ok:
+                continue
+            scans = await self._scans_remaining()
+            if scans > 0:
+                self._account_index = idx
+                logger.info(f"Using account: {account['email']} ({scans} scans left)")
+                return True
+            else:
+                logger.warning(f"Account {account['email']} has 0 scans — trying next")
+                # close this context and try next
+                if self._context:
+                    try:
+                        await self._context.close()
+                    except Exception:
+                        pass
+                    self._context = None
+        logger.error("All accounts exhausted — no scans available")
+        return False
 
     async def _scans_remaining(self) -> int:
         page = await self._context.new_page()
@@ -130,14 +169,14 @@ class ATSScanner:
             return await self._do_scan(resume_text, jd_text)
 
     async def _do_scan(self, resume_text: str, jd_text: str) -> dict:
-        # Ensure we have a logged-in session
+        # Ensure we have a logged-in session with scans available
         if self._context is None:
-            logger.info("No session — logging in...")
-            ok = await self._login()
+            logger.info("No session — finding account with scans...")
+            ok = await self._login_next_account()
             if not ok:
                 return {
                     "score": 0, "matched_keywords": [], "missing_keywords": [],
-                    "error": "Login failed. Check MASTER_EMAIL / MASTER_PASSWORD in Railway."
+                    "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
                 }
         else:
             logger.info("Reusing existing session.")
@@ -185,6 +224,26 @@ class ATSScanner:
             await asyncio.sleep(4)
             current_url = page.url
             logger.info(f"URL after click: {current_url}")
+
+            # If redirected to subscription page, this account has no scans — rotate
+            if "subscription" in current_url:
+                logger.warning("Redirected to subscription — account out of scans, rotating...")
+                await page.close()
+                if self._context:
+                    try:
+                        await self._context.close()
+                    except Exception:
+                        pass
+                    self._context = None
+                self._account_index = (self._account_index + 1) % len(ACCOUNTS)
+                ok = await self._login_next_account()
+                if not ok:
+                    return {
+                        "score": 0, "matched_keywords": [], "missing_keywords": [],
+                        "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
+                    }
+                # Restart scan with new account
+                return await self._do_scan(resume_text, jd_text)
 
             # Detect what kind of input the modal uses
             html = await page.content()
