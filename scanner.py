@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 
 from playwright.async_api import async_playwright
 
@@ -17,26 +16,27 @@ logger = logging.getLogger(__name__)
 MASTER_EMAIL    = os.environ.get("MASTER_EMAIL", "")
 MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD", "")
 
+# System Chromium installed by apt-get in Dockerfile
+CHROMIUM_PATHS = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+]
 
 def _find_chromium() -> str | None:
-    """Find Chromium binary — system (Nix) first, then Playwright's own."""
-    # 1. System chromium installed by Nix (most reliable on Railway)
-    system = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
-    if system:
-        logger.info(f"Using system Chromium: {system}")
-        return system
-
-    # 2. Playwright's downloaded binary
-    try:
-        result = subprocess.run(
-            ["python", "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=180
-        )
-        logger.info("Playwright chromium install done.")
-    except Exception as e:
-        logger.warning(f"Playwright install warning: {e}")
-
-    return None  # Let Playwright find its own
+    """Return path to system Chromium binary."""
+    for path in CHROMIUM_PATHS:
+        if os.path.exists(path):
+            logger.info(f"Found system Chromium: {path}")
+            return path
+    # fallback: search PATH
+    found = shutil.which("chromium") or shutil.which("chromium-browser")
+    if found:
+        logger.info(f"Found Chromium via PATH: {found}")
+        return found
+    logger.warning("No system Chromium found — letting Playwright use its own.")
+    return None
 
 
 class ATSScanner:
@@ -46,10 +46,10 @@ class ATSScanner:
     """
 
     def __init__(self):
-        self._playwright  = None
-        self._browser     = None
-        self._context     = None
-        self._lock        = asyncio.Lock()
+        self._playwright = None
+        self._browser    = None
+        self._context    = None
+        self._lock       = asyncio.Lock()
 
     async def _start_browser(self):
         if self._playwright is None:
@@ -57,7 +57,6 @@ class ATSScanner:
 
         if self._browser is None or not self._browser.is_connected():
             chromium_path = _find_chromium()
-
             launch_kwargs = dict(
                 headless=True,
                 args=[
@@ -66,13 +65,14 @@ class ATSScanner:
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--single-process",
+                    "--no-zygote",
                 ]
             )
             if chromium_path:
                 launch_kwargs["executable_path"] = chromium_path
 
             self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-            logger.info("Browser launched.")
+            logger.info("Browser launched successfully.")
 
     async def _login(self):
         if self._context:
@@ -130,7 +130,7 @@ class ATSScanner:
             return await self._do_scan(resume_text, jd_text)
 
     async def _do_scan(self, resume_text: str, jd_text: str) -> dict:
-        # Ensure logged-in session
+        # Ensure we have a logged-in session
         if self._context is None:
             logger.info("No session — logging in...")
             ok = await self._login()
@@ -159,28 +159,28 @@ class ATSScanner:
             )
 
             # Open New Scan modal
-            logger.info("Clicking New Scan...")
+            logger.info("Clicking New Scan button...")
             await page.get_by_role("button", name="New Scan").click()
             await page.get_by_role("heading", name="Create New Scan").wait_for(timeout=10000)
-            logger.info("Modal open!")
+            logger.info("Modal is open!")
 
-            # Fill Job Description — first contenteditable div in modal
+            # Fill Job Description — first contenteditable div
             jd_box = page.locator('div[contenteditable="true"]').nth(0)
             await jd_box.click()
             await jd_box.fill(jd_text)
             logger.info("JD filled.")
 
-            # Fill Resume — second contenteditable div in modal
+            # Fill Resume — second contenteditable div
             resume_box = page.locator('div[contenteditable="true"]').nth(1)
             await resume_box.click()
             await resume_box.fill(resume_text)
             logger.info("Resume filled.")
 
-            # Submit
+            # Click Scan
             await page.get_by_role("button", name="Scan").click()
-            logger.info("Scan submitted — waiting for results...")
+            logger.info("Scan submitted — waiting for results page...")
 
-            # Wait for results page /scans/<uuid>
+            # Wait for /scans/<uuid>
             await page.wait_for_url("**/scans/**", timeout=60000)
             await asyncio.sleep(3)
             logger.info(f"Results at: {page.url}")
@@ -210,7 +210,7 @@ class ATSScanner:
             if score is None:
                 score = 0
 
-            # Extract keywords from table
+            # Extract keywords from results table
             matched_keywords = []
             missing_keywords = []
             rows = re.findall(
