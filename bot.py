@@ -9,12 +9,11 @@ import json
 import asyncio
 import logging
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ConversationHandler,
     filters,
     ContextTypes,
@@ -36,11 +35,9 @@ logger = logging.getLogger(__name__)
 
 # ── Conversation States ──────────────────────────────────────
 (
-    WAITING_ACCOUNT_CHOICE,
-    WAITING_COOKIES,
     WAITING_RESUME,
     WAITING_JD,
-) = range(4)
+) = range(2)
 
 # ── Storage & Scanner ────────────────────────────────────────
 storage = RedisStorage()
@@ -48,112 +45,16 @@ scanner = ATSScanner()
 
 
 # ════════════════════════════════════════════════════════════
-#  /start  — Entry point
+#  /start  — Entry point (goes straight to resume)
 # ════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     first_name = update.effective_user.first_name
 
-    has_cookies = storage.has_cookies(user_id)
-
-    if has_cookies:
-        await update.message.reply_text(
-            f"👋 Welcome back, *{first_name}!*\n\n"
-            f"✅ Your SkillSyncer account is connected.\n\n"
-            f"📄 Please send your *Resume* as text to begin.",
-            parse_mode="Markdown"
-        )
-        return WAITING_RESUME
-
-    else:
-        keyboard = [
-            [InlineKeyboardButton("✅ Yes, I have an account", callback_data="has_account")],
-            [InlineKeyboardButton("❌ No account (use shared)", callback_data="no_account")],
-        ]
-        await update.message.reply_text(
-            f"👋 Hello *{first_name}!* Welcome to *ATS Score Bot*\n\n"
-            f"I'll check how well your resume matches a job description "
-            f"using SkillSyncer!\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Do you have a *SkillSyncer* account?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return WAITING_ACCOUNT_CHOICE
-
-
-# ════════════════════════════════════════════════════════════
-#  Account Choice Handler
-# ════════════════════════════════════════════════════════════
-async def account_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if query.data == "has_account":
-        await query.message.reply_text(
-            "🍪 *One-Time Cookie Setup*\n\n"
-            "Since SkillSyncer uses login, we use your browser cookies.\n"
-            "This is a *one-time setup only!*\n\n"
-            "📋 *Steps to get your cookies:*\n\n"
-            "1️⃣ Open *Chrome* on your PC/laptop\n"
-            "2️⃣ Go to 👉 skillsyncer.com and *log in*\n"
-            "3️⃣ Install extension: *Cookie-Editor*\n"
-            "   (search in Chrome Web Store)\n"
-            "4️⃣ Click the Cookie-Editor icon\n"
-            "5️⃣ Click *Export → Export as JSON*\n"
-            "6️⃣ It copies to clipboard automatically\n"
-            "7️⃣ *Paste it here* in this chat\n\n"
-            "🔒 _Your cookies are encrypted and stored securely._\n"
-            "⏳ _They auto-delete after 30 days._",
-            parse_mode="Markdown"
-        )
-        return WAITING_COOKIES
-
-    elif query.data == "no_account":
-        storage.set_use_master(user_id)
-        await query.message.reply_text(
-            "✅ *Using our shared SkillSyncer account!*\n\n"
-            "⚠️ Note: Shared account has limited scans.\n"
-            "For unlimited scans, create a free account at skillsyncer.com\n\n"
-            "📄 Now send your *Resume* as text:",
-            parse_mode="Markdown"
-        )
-        return WAITING_RESUME
-
-
-# ════════════════════════════════════════════════════════════
-#  Cookie Handler
-# ════════════════════════════════════════════════════════════
-async def save_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    cookies_text = update.message.text.strip()
-
-    try:
-        cookies_data = json.loads(cookies_text)
-        if not isinstance(cookies_data, list):
-            raise ValueError("Not a list")
-    except (json.JSONDecodeError, ValueError):
-        await update.message.reply_text(
-            "❌ *Invalid cookies format!*\n\n"
-            "Please make sure you:\n"
-            "• Used Cookie-Editor extension\n"
-            "• Clicked *Export as JSON*\n"
-            "• Pasted the full JSON text\n\n"
-            "Try again 👇",
-            parse_mode="Markdown"
-        )
-        return WAITING_COOKIES
-
-    size_kb = len(cookies_text) / 1024
-    storage.save_cookies(user_id, cookies_text)
-
     await update.message.reply_text(
-        f"✅ *Cookies saved successfully!*\n"
-        f"📦 Size: {size_kb:.1f} KB\n"
-        f"⏳ Auto-expires in 30 days\n\n"
-        f"You won't need to do this again until they expire.\n\n"
-        f"📄 Now send your *Resume* as text:",
+        f"👋 Hello *{first_name}!* Welcome to *ATS Score Bot*\n\n"
+        f"I'll check how well your resume matches a job description!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📄 Please send your *Resume* as text to begin:",
         parse_mode="Markdown"
     )
     return WAITING_RESUME
@@ -214,33 +115,17 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     status_msg = await update.message.reply_text(
         "⏳ *Checking your ATS score...*\n\n"
-        "🔄 Loading your SkillSyncer session\n"
-        "🤖 Running analysis (30-60 seconds)\n"
+        "🔄 Running analysis (30-60 seconds)\n"
         "Please wait...",
         parse_mode="Markdown"
     )
 
     try:
-        use_master = storage.get_use_master(user_id)
-        if use_master:
-            cookies = None
-        else:
-            cookies = storage.get_cookies(user_id)
-            if not cookies:
-                await status_msg.edit_text(
-                    "⚠️ *Your SkillSyncer session expired!*\n\n"
-                    "Please send fresh cookies:\n"
-                    "1️⃣ Go to skillsyncer.com (logged in)\n"
-                    "2️⃣ Cookie-Editor → Export as JSON\n"
-                    "3️⃣ Paste here",
-                    parse_mode="Markdown"
-                )
-                return WAITING_COOKIES
-
+        # Always use master account silently — no user cookies needed
         result = await scanner.scan(
             resume_text=resume_text,
             jd_text=jd_text,
-            cookies=cookies,
+            cookies=None,
             user_id=user_id
         )
 
@@ -251,16 +136,11 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
         missing = result.get("missing_keywords", [])
         error   = result.get("error")
 
-        if error == "session_expired":
-            storage.delete_cookies(user_id)
-            await status_msg.edit_text(
-                "⚠️ *Session expired!*\n\nPlease send fresh cookies.",
-                parse_mode="Markdown"
-            )
-            return WAITING_COOKIES
-
         if error:
-            await status_msg.edit_text(f"❌ Error: {error}\n\nTry /start again.")
+            await status_msg.edit_text(
+                f"❌ Something went wrong. Please try /start again.\n"
+                f"Error: {str(error)[:100]}"
+            )
             return ConversationHandler.END
 
         try:
@@ -310,22 +190,6 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ════════════════════════════════════════════════════════════
-#  /reset
-# ════════════════════════════════════════════════════════════
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    storage.delete_cookies(user_id)
-    storage.delete_use_master(user_id)
-    await update.message.reply_text(
-        "🗑️ *Reset complete!*\n\n"
-        "Your saved session has been cleared.\n"
-        "Use /start to set up again.",
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
-
-
-# ════════════════════════════════════════════════════════════
 #  /cancel
 # ════════════════════════════════════════════════════════════
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -345,12 +209,6 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            WAITING_ACCOUNT_CHOICE: [
-                CallbackQueryHandler(account_choice)
-            ],
-            WAITING_COOKIES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_cookies)
-            ],
             WAITING_RESUME: [
                 MessageHandler(
                     (filters.TEXT | filters.Document.TXT) & ~filters.COMMAND,
@@ -363,16 +221,14 @@ def main():
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CommandHandler("reset", reset),
             CommandHandler("start", start),
         ],
         allow_reentry=True,
     )
 
     app.add_handler(conv)
-    app.add_handler(CommandHandler("reset", reset))
 
-    logger.info("🤖 ATS Bot is running on Render!")
+    logger.info("🤖 ATS Bot is running!")
     app.run_polling(drop_pending_updates=True)
 
 
