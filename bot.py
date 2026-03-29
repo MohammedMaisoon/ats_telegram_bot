@@ -1,11 +1,11 @@
 """
 ATS Score Telegram Bot
 Main bot file - handles all Telegram interactions
-Includes keep-alive for Render free tier (no sleep!)
 """
 
 import os
-import json
+import io
+import fitz  # PyMuPDF
 import asyncio
 import logging
 from dotenv import load_dotenv
@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 from storage import RedisStorage
 from scanner import ATSScanner
-from keep_alive import keep_alive          # ← Render no-sleep
+from keep_alive import keep_alive
 
 # ── Load env variables ──────────────────────────────────────
 load_dotenv()
@@ -45,7 +45,7 @@ scanner = ATSScanner()
 
 
 # ════════════════════════════════════════════════════════════
-#  /start  — Entry point (goes straight to resume)
+#  /start
 # ════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = update.effective_user.first_name
@@ -54,35 +54,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Hello *{first_name}!* Welcome to *ATS Score Bot*\n\n"
         f"I'll check how well your resume matches a job description!\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📄 Please send your *Resume* as text to begin:",
+        f"📄 Send your *Resume* as a *PDF file* or paste as text:",
         parse_mode="Markdown"
     )
     return WAITING_RESUME
 
 
 # ════════════════════════════════════════════════════════════
-#  Resume Handler
+#  Resume Handler — accepts PDF or text
 # ════════════════════════════════════════════════════════════
 async def receive_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    resume_text = ""
 
     if update.message.document:
         doc = update.message.document
-        if doc.file_size > 500_000:
-            await update.message.reply_text(
-                "❌ File too large. Please paste resume as text."
-            )
+        mime = doc.mime_type or ""
+
+        # ── PDF ──────────────────────────────────────────────
+        if mime == "application/pdf" or doc.file_name.endswith(".pdf"):
+            if doc.file_size > 5_000_000:
+                await update.message.reply_text("❌ PDF too large (max 5MB). Try a smaller file.")
+                return WAITING_RESUME
+            file = await doc.get_file()
+            file_bytes = await file.download_as_bytearray()
+            try:
+                pdf = fitz.open(stream=bytes(file_bytes), filetype="pdf")
+                for page in pdf:
+                    resume_text += page.get_text()
+                pdf.close()
+            except Exception as e:
+                await update.message.reply_text(f"❌ Could not read PDF. Try pasting as text.\nError: {e}")
+                return WAITING_RESUME
+
+        # ── Plain text file ──────────────────────────────────
+        elif mime.startswith("text/") or doc.file_name.endswith(".txt"):
+            if doc.file_size > 500_000:
+                await update.message.reply_text("❌ File too large. Please paste resume as text.")
+                return WAITING_RESUME
+            file = await doc.get_file()
+            file_bytes = await file.download_as_bytearray()
+            resume_text = file_bytes.decode("utf-8", errors="ignore")
+
+        else:
+            await update.message.reply_text("❌ Please send a *PDF* file or paste resume as text.", parse_mode="Markdown")
             return WAITING_RESUME
-        file = await doc.get_file()
-        file_bytes = await file.download_as_bytearray()
-        resume_text = file_bytes.decode("utf-8", errors="ignore")
-    else:
+
+    elif update.message.text:
         resume_text = update.message.text
 
+    else:
+        await update.message.reply_text("❌ Please send your resume as a PDF or text.")
+        return WAITING_RESUME
+
     if len(resume_text.strip()) < 50:
-        await update.message.reply_text(
-            "❌ Resume too short. Please send full resume text."
-        )
+        await update.message.reply_text("❌ Resume too short or empty. Please try again.")
         return WAITING_RESUME
 
     storage.save_temp(user_id, "resume", resume_text)
@@ -103,9 +129,7 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
     jd_text = update.message.text
 
     if len(jd_text.strip()) < 50:
-        await update.message.reply_text(
-            "❌ JD too short. Please send the full job description."
-        )
+        await update.message.reply_text("❌ JD too short. Please send the full job description.")
         return WAITING_JD
 
     resume_text = storage.get_temp(user_id, "resume")
@@ -121,7 +145,6 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     try:
-        # Always use master account silently — no user cookies needed
         result = await scanner.scan(
             resume_text=resume_text,
             jd_text=jd_text,
@@ -138,28 +161,22 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if error:
             await status_msg.edit_text(
-                f"❌ Something went wrong. Please try /start again.\n"
-                f"Error: {str(error)[:100]}"
+                f"❌ Something went wrong. Please try /start again.\nError: {str(error)[:100]}"
             )
             return ConversationHandler.END
 
         try:
             score_int = int(str(score).replace("%", "").strip())
             if score_int >= 75:
-                emoji   = "🟢"
-                verdict = "Excellent Match!"
+                emoji, verdict = "🟢", "Excellent Match!"
             elif score_int >= 55:
-                emoji   = "🟡"
-                verdict = "Good Match"
+                emoji, verdict = "🟡", "Good Match"
             elif score_int >= 35:
-                emoji   = "🟠"
-                verdict = "Partial Match"
+                emoji, verdict = "🟠", "Partial Match"
             else:
-                emoji   = "🔴"
-                verdict = "Poor Match"
+                emoji, verdict = "🔴", "Poor Match"
         except:
-            emoji   = "📊"
-            verdict = "Score Retrieved"
+            emoji, verdict = "📊", "Score Retrieved"
 
         matched_str = ", ".join(matched[:12]) if matched else "None found"
         missing_str = ", ".join(missing[:12]) if missing else "None — great job!"
@@ -182,8 +199,7 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Scan error for user {user_id}: {e}")
         await status_msg.edit_text(
-            f"❌ Something went wrong. Please try /start again.\n"
-            f"Error: {str(e)[:100]}"
+            f"❌ Something went wrong. Please try /start again.\nError: {str(e)[:100]}"
         )
 
     return ConversationHandler.END
@@ -201,7 +217,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  Main
 # ════════════════════════════════════════════════════════════
 def main():
-    # ✅ Start keep-alive FIRST (prevents Render sleep)
     keep_alive()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -211,7 +226,7 @@ def main():
         states={
             WAITING_RESUME: [
                 MessageHandler(
-                    (filters.TEXT | filters.Document.TXT) & ~filters.COMMAND,
+                    (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND,
                     receive_resume
                 )
             ],

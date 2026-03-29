@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# build.sh — Render runs this during build phase
+# build.sh — Railway/Render runs this during build phase
 set -e
 
 echo "📦 Installing Python dependencies..."
-pip install -r ats_bot/requirements.txt
+pip install -r requirements.txt
 
-echo "🌐 Installing Playwright + Chromium..."
+echo "🌐 Installing Playwright system dependencies..."
+playwright install-deps chromium
+
+echo "🌐 Installing Playwright Chromium browser..."
 playwright install chromium
-
 
 echo "✅ Build complete!"
