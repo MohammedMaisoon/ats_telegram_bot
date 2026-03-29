@@ -158,64 +158,83 @@ class ATSScanner:
                 timeout=20000
             )
 
-            # Open New Scan modal — try multiple selectors
+            # Open New Scan modal
             logger.info("Clicking New Scan button...")
             await page.wait_for_load_state("networkidle", timeout=10000)
-            await page.screenshot(path="/tmp/dashboard.png")
-            html = await page.content()
-            logger.info(f"PAGE HTML SNIPPET: {html[2000:4000]}")
 
-
-            # Try all known button selectors
+            # Try multiple selectors for the New Scan button
             clicked = False
             for selector in [
-                "button[name='New Scan']",
                 "button:has-text('New Scan')",
                 "a:has-text('New Scan')",
-                "[data-testid='new-scan']",
-                "button.btn:has-text('Scan')",
                 "text=New Scan",
+                "button[name='New Scan']",
             ]:
                 try:
                     el = page.locator(selector).first
                     if await el.is_visible(timeout=2000):
                         await el.click()
                         clicked = True
-                        logger.info(f"Clicked using selector: {selector}")
+                        logger.info(f"Clicked: {selector}")
                         break
                 except Exception:
                     continue
-
             if not clicked:
-                raise Exception("Could not find New Scan button — check /tmp/dashboard.png screenshot")
+                raise Exception("Could not find New Scan button")
 
-            await asyncio.sleep(4)  # Wait for modal animation
-            await page.screenshot(path="/tmp/modal.png")
-            logger.info("Modal screenshot saved.")
+            await asyncio.sleep(4)
+            current_url = page.url
+            logger.info(f"URL after click: {current_url}")
 
-            # Wait for contenteditable boxes to appear inside modal
-            logger.info("Waiting for JD input box...")
-            await page.wait_for_selector('div[contenteditable="true"]', timeout=15000)
-            await asyncio.sleep(1)
+            # Detect what kind of input the modal uses
+            html = await page.content()
+            has_contenteditable = 'contenteditable="true"' in html
+            has_prosemirror = 'ProseMirror' in html
+            has_textarea = '<textarea' in html
+            logger.info(f"contenteditable={has_contenteditable} ProseMirror={has_prosemirror} textarea={has_textarea}")
 
-            # Fill Job Description — first contenteditable div
-            jd_box = page.locator('div[contenteditable="true"]').nth(0)
-            await jd_box.scroll_into_view_if_needed()
-            await jd_box.click()
-            await asyncio.sleep(0.5)
-            await page.keyboard.type(jd_text, delay=5)
-            logger.info("JD filled.")
+            if has_prosemirror or has_contenteditable:
+                # Wait for the editor boxes
+                await page.wait_for_selector('.ProseMirror, div[contenteditable="true"]', timeout=15000)
+                await asyncio.sleep(1)
+                editors = page.locator('.ProseMirror, div[contenteditable="true"]')
+                count = await editors.count()
+                logger.info(f"Found {count} editor boxes")
 
-            # Fill Resume — second contenteditable div
-            resume_box = page.locator('div[contenteditable="true"]').nth(1)
-            await resume_box.scroll_into_view_if_needed()
-            await resume_box.click()
-            await asyncio.sleep(0.5)
-            await page.keyboard.type(resume_text, delay=5)
-            logger.info("Resume filled.")
+                jd_box = editors.nth(0)
+                await jd_box.scroll_into_view_if_needed()
+                await jd_box.click()
+                await asyncio.sleep(0.3)
+                await page.keyboard.type(jd_text, delay=5)
+                logger.info("JD filled.")
 
-            # Click Scan
-            await page.get_by_role("button", name="Scan").click()
+                resume_box = editors.nth(1)
+                await resume_box.scroll_into_view_if_needed()
+                await resume_box.click()
+                await asyncio.sleep(0.3)
+                await page.keyboard.type(resume_text, delay=5)
+                logger.info("Resume filled.")
+
+            elif has_textarea:
+                await page.wait_for_selector('textarea', timeout=15000)
+                textareas = page.locator('textarea')
+                await textareas.nth(0).fill(jd_text)
+                await textareas.nth(1).fill(resume_text)
+                logger.info("Filled via textarea.")
+
+            else:
+                raise Exception(f"No input found on page. URL={current_url}")
+
+            # Click Scan submit button
+            for sel in ["button:has-text('Scan')", "button[name='Scan']", "button[type='submit']"]:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        logger.info(f"Scan submitted via: {sel}")
+                        break
+                except Exception:
+                    continue
             logger.info("Scan submitted — waiting for results page...")
 
             # Wait for /scans/<uuid>
