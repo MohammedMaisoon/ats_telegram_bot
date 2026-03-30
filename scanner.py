@@ -189,13 +189,29 @@ class ATSScanner:
         else:
             logger.info("Reusing existing session.")
 
-        # Check scans remaining
+        # Check scans remaining — if 0, rotate to next account
         remaining = await self._scans_remaining()
         if remaining == 0:
-            return {
-                "score": 0, "matched_keywords": [], "missing_keywords": [],
-                "error": "No scans left on SkillSyncer (free plan: 2/week). Resets every Sunday."
-            }
+            logger.warning("Current account has 0 scans — rotating to next account...")
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+            self._account_index = (self._account_index + 1) % len(ACCOUNTS)
+            ok = await self._login_next_account()
+            if not ok:
+                return {
+                    "score": 0, "matched_keywords": [], "missing_keywords": [],
+                    "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
+                }
 
         page = await self._context.new_page()
         try:
