@@ -176,7 +176,9 @@ class ATSScanner:
         async with self._lock:
             return await self._do_scan(resume_text, jd_text)
 
-    async def _do_scan(self, resume_text: str, jd_text: str) -> dict:
+    async def _do_scan(self, resume_text: str, jd_text: str, _retry: int = 0) -> dict:
+        if _retry >= 5:
+            return {"score": 0, "matched_keywords": [], "missing_keywords": [], "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"}
         # Ensure we have a logged-in session with scans available
         if self._context is None:
             logger.info("No session — finding account with scans...")
@@ -276,7 +278,7 @@ class ATSScanner:
                         "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
                     }
                 # Restart scan with new account
-                return await self._do_scan(resume_text, jd_text)
+                return await self._do_scan(resume_text, jd_text, _retry=_retry+1)
 
             # Detect what kind of input the modal uses
             html = await page.content()
