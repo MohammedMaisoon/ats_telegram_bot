@@ -56,8 +56,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Hello *{first_name}!* Welcome to *ATS Score Bot*\n\n"
         f"I'll check how well your resume matches a job description!\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📄 Send your *Resume* as a *PDF* or *TXT file*, or paste text in one message.\n"
-        f"If your resume is long, send it as a file, or paste multiple chunks and finish with /done.",
+        f"📄 Send your *Resume* as a *PDF* or *TXT file only*.\n"
+        f"The resume must be a file. Job descriptions can be pasted as text."
+        f" If your resume or JD is long, use file upload or send the JD in chunks and finish with /done.",
         parse_mode="Markdown"
     )
     return WAITING_RESUME
@@ -104,30 +105,26 @@ async def receive_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return WAITING_RESUME
 
     elif update.message.text:
-        resume_text = update.message.text
-    else:
-        await update.message.reply_text("❌ Please send your resume as a PDF or text.")
-        return WAITING_RESUME
-
-    existing_resume = storage.get_temp(user_id, "resume") or ""
-    combined_resume = f"{existing_resume}\n{resume_text}" if existing_resume else resume_text
-    storage.save_temp(user_id, "resume", combined_resume)
-
-    if existing_resume or len(combined_resume) > 2000:
         await update.message.reply_text(
-            "✅ Resume part received. Send more text if needed, or send /done when finished.\n"
-            "You can also send a PDF or TXT file as the next message."
+            "❌ The resume must be sent as a file (PDF or TXT)."
+            " Job descriptions can be sent as text."
         )
         return WAITING_RESUME
+    else:
+        await update.message.reply_text("❌ Please send your resume as a PDF or TXT file.")
+        return WAITING_RESUME
 
-    if len(combined_resume.strip()) < 50:
+    storage.save_temp(user_id, "resume", resume_text)
+
+    if len(resume_text.strip()) < 50:
         await update.message.reply_text("❌ Resume too short or empty. Please try again.")
         return WAITING_RESUME
 
     await update.message.reply_text(
         "✅ *Resume received!*\n\n"
-        "📋 Now send the *Job Description* as a *PDF*/*TXT file* or paste text in one message.\n"
-        "If the JD is long, send it as a file, or paste multiple chunks and finish with /done.",
+        "📋 Now send the *Job Description* as text or a *PDF*/*TXT file*.\n"
+        "If the JD is too long for one message, send it in chunks and finish with /done, or upload the JD as a file.\n"
+        "Resume must be sent only as a file.",
         parse_mode="Markdown"
     )
     return WAITING_JD
@@ -161,6 +158,11 @@ async def _extract_text_from_message(message):
             raise ValueError("Please send a PDF or text file.")
     elif message.text:
         content = message.text
+        if len(content) > 3500:
+            raise ValueError(
+                "Your JD message is too long for one Telegram message. "
+                "Please send the JD as a file or split it into smaller chunks and finish with /done."
+            )
     return content
 
 

@@ -5,6 +5,7 @@ All selectors verified live on app.skillsyncer.com
 
 import os
 import json
+import re
 import asyncio
 import logging
 import shutil
@@ -211,8 +212,8 @@ class ATSScanner:
             return None
 
         try:
-            await page.goto(LOGIN_URL, wait_until="networkidle")
-            await asyncio.sleep(1)
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(2)
 
             email_input = await _find_input([
                 'input[type=email]',
@@ -221,10 +222,14 @@ class ATSScanner:
                 'input[placeholder*="email"]',
                 'input[autocomplete="off"][type="text"]',
                 'input[id*=email]',
-                'input[class*=email]'
+                'input[class*=email]',
+                'input[role="textbox"]'
             ])
             if not email_input:
-                email_input = page.get_by_role("textbox", name=re.compile("email", re.I))
+                try:
+                    email_input = page.get_by_role("textbox", name=re.compile("email", re.I))
+                except Exception:
+                    email_input = page.locator('input[type=email], input[type=text]').first
 
             password_input = await _find_input([
                 'input[type=password]',
@@ -234,17 +239,25 @@ class ATSScanner:
                 'input[class*=password]'
             ])
             if not password_input:
-                password_input = page.get_by_role("textbox", name=re.compile("password", re.I))
+                try:
+                    password_input = page.get_by_role("textbox", name=re.compile("password", re.I))
+                except Exception:
+                    password_input = page.locator('input[type=password]').first
 
             sign_in_button = await _find_input([
                 'button:has-text("Sign In")',
                 'button:has-text("Sign in")',
                 'button:has-text("Log In")',
                 'button:has-text("Log in")',
-                'button[type=submit]'
+                'button[type=submit]',
+                'button[name*=login]',
+                'button[name*=signin]'
             ])
             if not sign_in_button:
-                sign_in_button = page.get_by_role("button", name=re.compile("sign.*in|log.*in", re.I))
+                try:
+                    sign_in_button = page.get_by_role("button", name=re.compile("sign.*in|log.*in|submit", re.I))
+                except Exception:
+                    sign_in_button = page.locator('button').filter(has_text=re.compile("sign in|log in|submit", re.I)).first
 
             if not email_input or not password_input or not sign_in_button:
                 logger.error("Login form elements not found")
@@ -257,9 +270,10 @@ class ATSScanner:
             await sign_in_button.click()
 
             try:
-                await page.wait_for_url("**/dashboard**", timeout=30000)
+                await page.wait_for_url("**/dashboard**", timeout=60000)
             except Exception:
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
+                await page.wait_for_load_state("networkidle", timeout=60000)
 
             if "login" in page.url:
                 logger.error("Login failed — still on login page")
@@ -279,8 +293,26 @@ class ATSScanner:
         try:
             # ── Step 1: Click "New Scan" button in sidebar ──
             # EXACT: button with text "New Scan" ref=e37
-            await page.get_by_role("button", name="New Scan").click()
-            await asyncio.sleep(2)
+            try:
+                await page.wait_for_selector('button:has-text("New Scan"), a:has-text("New Scan")', timeout=90000)
+                await page.locator('button:has-text("New Scan"), a:has-text("New Scan")').first.click()
+            except Exception:
+                # fallback to broader selectors
+                for sel in [
+                    'button:has-text("New Scan")',
+                    'a:has-text("New Scan")',
+                    'text=New Scan',
+                    'button[name="New Scan"]',
+                    'button:has-text("Create Scan")',
+                    'button:has-text("New scan")',
+                ]:
+                    try:
+                        await page.wait_for_selector(sel, timeout=10000)
+                        await page.locator(sel).first.click()
+                        break
+                    except Exception:
+                        continue
+            await asyncio.sleep(4)
             logger.info("New Scan modal opened")
 
             # ── Step 2: Fill Company Name ────────────────────
@@ -295,31 +327,62 @@ class ATSScanner:
 
             # ── Step 4: Fill Job Description ─────────────────
             # EXACT: .ProseMirror nth=0 — rich text editor for JD
-            await page.locator('.ProseMirror').nth(0).click()
+            jd_editor = page.locator('.ProseMirror').nth(0)
+            await jd_editor.wait_for(state='visible', timeout=60000)
+            await jd_editor.click()
             await asyncio.sleep(0.3)
-            await page.locator('.ProseMirror').nth(0).fill(jd_text)
+            try:
+                await jd_editor.fill(jd_text)
+            except Exception:
+                await jd_editor.evaluate("el => el.innerText = ''")
+                await page.keyboard.type(jd_text, delay=5)
             await asyncio.sleep(0.5)
 
             # ── Step 5: Fill Resume ──────────────────────────
             # EXACT: .ProseMirror nth=1 — rich text editor for Resume
-            await page.locator('.ProseMirror').nth(1).click()
+            resume_editor = page.locator('.ProseMirror').nth(1)
+            await resume_editor.wait_for(state='visible', timeout=60000)
+            await resume_editor.click()
             await asyncio.sleep(0.3)
-            await page.locator('.ProseMirror').nth(1).fill(resume_text)
+            try:
+                await resume_editor.fill(resume_text)
+            except Exception:
+                await resume_editor.evaluate("el => el.innerText = ''")
+                await page.keyboard.type(resume_text, delay=5)
             await asyncio.sleep(0.5)
 
             # ── Step 6: Click Scan button ────────────────────
             # EXACT: button "Scan" exact=True (not New Scan / Create Scan)
-            await page.get_by_role("button", name="Scan", exact=True).click()
+            scan_btn = None
+            for sel in [
+                'button:has-text("Scan")',
+                'button:has-text("Start Scan")',
+                'button:has-text("Analyze")',
+                'button:has-text("Submit")',
+                'button[type=submit]'
+            ]:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() and await btn.is_visible(timeout=3000):
+                        scan_btn = btn
+                        break
+                except Exception:
+                    continue
+            if not scan_btn:
+                raise Exception("Could not find Scan button")
+            await scan_btn.click()
             logger.info("Scan submitted — waiting for results...")
 
             # ── Step 7: Wait for results page ───────────────
-            await page.wait_for_load_state("networkidle")
-            await asyncio.sleep(5)
-
-            # Confirm we're on scan results URL
-            if "/scans/" not in page.url:
-                logger.warning(f"Unexpected URL after scan: {page.url}")
-                await asyncio.sleep(5)  # wait more
+            try:
+                await page.wait_for_url("**/scans/**", timeout=120000)
+            except Exception:
+                logger.info("Scan results URL not detected; waiting for results content...")
+                await page.wait_for_load_state("networkidle", timeout=120000)
+                await asyncio.sleep(5)
+                if "/scans/" not in page.url:
+                    logger.warning(f"Unexpected URL after scan: {page.url}")
+            logger.info(f"Results page: {page.url}")
 
             logger.info(f"Results page: {page.url}")
 
