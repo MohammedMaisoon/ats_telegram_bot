@@ -57,8 +57,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"I'll check how well your resume matches a job description!\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📄 Send your *Resume* as a *PDF* or *TXT file only*.\n"
-        f"The resume must be a file. Job descriptions can be pasted as text."
-        f" If your resume or JD is long, use file upload or send the JD in chunks and finish with /done.",
+        f"The resume must be a file. Job descriptions can be pasted as text or uploaded as a file.\n"
+        f"If your resume or JD is long, send JD text in chunks and finish with /done.",
         parse_mode="Markdown"
     )
     return WAITING_RESUME
@@ -122,8 +122,8 @@ async def receive_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✅ *Resume received!*\n\n"
-        "📋 Now send the *Job Description* as text or a *PDF*/*TXT file*.\n"
-        "If the JD is too long for one message, send it in chunks and finish with /done, or upload the JD as a file.\n"
+        "📋 Now send the *Job Description* as text. If it's long, send it in chunks and finish with /done.\n"
+        "You may also upload the JD as a PDF or TXT file if you prefer.\n"
         "Resume must be sent only as a file.",
         parse_mode="Markdown"
     )
@@ -158,10 +158,10 @@ async def _extract_text_from_message(message):
             raise ValueError("Please send a PDF or text file.")
     elif message.text:
         content = message.text
-        if len(content) > 3500:
+        if len(content) > 10000:
             raise ValueError(
-                "Your JD message is too long for one Telegram message. "
-                "Please send the JD as a file or split it into smaller chunks and finish with /done."
+                "Your JD message is too long for a single submission. "
+                "Please split it into smaller text chunks and finish with /done, or upload the JD as a file."
             )
     return content
 
@@ -181,7 +181,7 @@ async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
     if existing_jd or len(combined_jd) > 2000:
         await update.message.reply_text(
             "✅ JD part received. Send more text if needed, or send /done when finished.\n"
-            "You can also send a PDF or TXT file as the next message."
+            "You can continue sending text chunks or optionally upload a PDF/TXT file."
         )
         return WAITING_JD
 
@@ -377,7 +377,10 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Document.ALL & ~filters.COMMAND, receive_resume),
+        ],
         states={
             WAITING_RESUME: [
                 MessageHandler(
