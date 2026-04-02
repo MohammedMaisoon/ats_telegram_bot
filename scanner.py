@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+from collections import Counter
 
 from playwright.async_api import async_playwright
 
@@ -105,10 +106,74 @@ class ATSScanner:
                 wait_until="domcontentloaded",
                 timeout=30000
             )
-            await page.get_by_role("textbox", name="you@mail.com").fill(account["email"])
-            await page.get_by_role("textbox", name="password").fill(account["password"])
-            await page.get_by_role("button", name="Sign In").click()
-            await page.wait_for_url("**/dashboard", timeout=20000)
+
+            email_input = None
+            password_input = None
+            sign_in_button = None
+
+            # Robust email field selection
+            for selector in [
+                "input[type=email]",
+                "input[name*=email]",
+                "input[placeholder*='Email']",
+                "input[placeholder*='email']",
+                "input[id*=email]",
+                "input[class*=email]"
+            ]:
+                try:
+                    el = page.locator(selector).first
+                    if await el.count() and await el.is_visible(timeout=2000):
+                        email_input = el
+                        break
+                except Exception:
+                    continue
+
+            if email_input is None:
+                email_input = page.get_by_role("textbox", name=re.compile("email", re.I))
+
+            # Robust password field selection
+            for selector in [
+                "input[type=password]",
+                "input[name*=password]",
+                "input[placeholder*='Password']",
+                "input[id*=password]",
+                "input[class*=password]"
+            ]:
+                try:
+                    el = page.locator(selector).first
+                    if await el.count() and await el.is_visible(timeout=2000):
+                        password_input = el
+                        break
+                except Exception:
+                    continue
+
+            if password_input is None:
+                password_input = page.get_by_role("textbox", name=re.compile("password", re.I))
+
+            # Robust sign-in button selection
+            for selector in [
+                "button:has-text('Sign In')",
+                "button:has-text('Sign in')",
+                "button[type=submit]",
+                "button:has-text('Login')",
+                "button:has-text('Log In')"
+            ]:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.count() and await btn.is_visible(timeout=2000):
+                        sign_in_button = btn
+                        break
+                except Exception:
+                    continue
+
+            if email_input is None or password_input is None or sign_in_button is None:
+                raise Exception("Login form not found")
+
+            await email_input.fill(account["email"])
+            await password_input.fill(account["password"])
+            await sign_in_button.click()
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_url("**/dashboard", timeout=30000)
             logger.info(f"Login successful: {account['email']}")
             return True
         except Exception as e:
@@ -161,7 +226,11 @@ class ATSScanner:
                 timeout=20000
             )
             text = await page.evaluate("() => document.body.innerText")
-            match = re.search(r'Scans Left[:\s]+(\d+)', text)
+            match = re.search(r'Scans\s*Left[:\s]+(\d+)', text, re.IGNORECASE)
+            if not match:
+                match = re.search(r'(\d+)\s+scans?\s+left', text, re.IGNORECASE)
+            if not match:
+                match = re.search(r'(\d+)\s+remaining', text, re.IGNORECASE)
             count = int(match.group(1)) if match else 1
             logger.info(f"Scans remaining: {count}")
             return count
@@ -175,6 +244,174 @@ class ATSScanner:
                    cookies=None, user_id=None) -> dict:
         async with self._lock:
             return await self._do_scan(resume_text, jd_text)
+
+    async def _set_field_text(self, locator, text: str):
+        tag = await locator.evaluate("el => el.tagName.toLowerCase()")
+        if tag in ("textarea", "input"):
+            await locator.fill(text)
+            return
+
+        await locator.evaluate(
+            "(el, value) => {"
+            "  el.focus();"
+            "  if ('value' in el) el.value = value;"
+            "  if ('innerText' in el) el.innerText = value;"
+            "  el.textContent = value;"
+            "  el.dispatchEvent(new InputEvent('input', { bubbles: true }));"
+            "  el.dispatchEvent(new Event('change', { bubbles: true }));"
+            "}",
+            text
+        )
+        await asyncio.sleep(0.1)
+
+    async def _collect_editor_fields(self, page):
+        fields = []
+        editors = page.locator('.ProseMirror, div[contenteditable="true"], textarea')
+        count = await editors.count()
+        for idx in range(count):
+            locator = editors.nth(idx)
+            hint = await locator.evaluate(
+                "el => {"
+                "  let node = el;"
+                "  while (node) {"
+                "    if (node.previousElementSibling && node.previousElementSibling.textContent) {"
+                "      const text = node.previousElementSibling.textContent.trim();"
+                "      if (text) return text;"
+                "    }"
+                "    node = node.parentElement;"
+                "  }"
+                "  return '';"
+                "}"
+            )
+            fields.append((locator, hint.lower() if hint else ""))
+        return fields
+
+    def _match_field_order(self, fields):
+        if len(fields) < 2:
+            return None
+
+        hints = [hint for _, hint in fields]
+        if any("resume" in hint for hint in hints) and any("job" in hint or "description" in hint for hint in hints):
+            resume_index = next(i for i, h in enumerate(hints) if "resume" in h)
+            jd_index = next(i for i, h in enumerate(hints) if "job" in h or "description" in h)
+            return resume_index, jd_index
+        return 0, 1
+
+    def _detect_subscription_page(self, page_url: str, text: str) -> bool:
+        if "subscription" in page_url or "billing" in page_url or "payment" in page_url:
+            return True
+        lower = text.lower()
+        return "subscription" in lower or "upgrade" in lower or "billing" in lower or "paid plan" in lower
+
+    def _wait_for_scan_results(self, page):
+        return page.wait_for_function(
+            "() => {"
+            "  const text = document.body.innerText.toLowerCase();"
+            "  return /match rate|score|result|matched keywords|missing keywords|your score/.test(text);"
+            "}",
+            timeout=90000
+        )
+
+    def _extract_keywords(self, text: str) -> list[str]:
+        cleaned = re.sub(r'[\r\n]+', ' ', text)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        stopwords = {
+            'and', 'or', 'the', 'for', 'with', 'from', 'that', 'this', 'these', 'those',
+            'will', 'have', 'has', 'your', 'you', 'are', 'is', 'in', 'on', 'to', 'of',
+            'a', 'an', 'as', 'be', 'by', 'at', 'we', 'our', 'us', 'may', 'also', 'can',
+            'experience', 'skills', 'skill', 'work', 'team', 'requirements', 'required',
+            'responsibilities', 'including', 'demonstrated', 'ability', 'strong', 'years',
+            'experience', 'using', 'business', 'technical', 'knowledge', 'candidate'
+        }
+
+        # Use meaningful JD lines first
+        lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip(' -•*\t')
+            if not line:
+                continue
+            if len(line) > 100:
+                parts = re.split(r'[,:;] +', line)
+                for part in parts:
+                    part = part.strip()
+                    if 15 <= len(part) <= 90:
+                        lines.append(part)
+            else:
+                lines.append(line)
+
+        candidates = []
+        for line in lines:
+            lower = line.lower()
+            if len(line.split()) >= 3 and any(term in lower for term in [
+                'experience', 'experience with', 'familiar', 'knowledge of',
+                'responsibilities', 'required', 'strong', 'prefer', 'must have',
+                'ability to', 'work with', 'manage', 'design', 'build', 'develop'
+            ]):
+                candidates.append(re.sub(r'[\.:;]+$', '', line).strip())
+
+        words = re.findall(r"[A-Za-z0-9+#]+", text)
+        freq = Counter(
+            w.lower() for w in words
+            if len(w) > 2 and w.lower() not in stopwords and not w.isdigit()
+        )
+        for word, _ in freq.most_common(40):
+            if word not in stopwords and word not in {c.lower() for c in candidates}:
+                candidates.append(word)
+            if len(candidates) >= 30:
+                break
+
+        cleaned_keywords = []
+        seen = set()
+        for item in candidates:
+            item_norm = re.sub(r'\s+', ' ', item).strip()
+            if len(item_norm) < 3:
+                continue
+            key = item_norm.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned_keywords.append(item_norm)
+            if len(cleaned_keywords) >= 30:
+                break
+
+        return cleaned_keywords
+
+    def _phrase_in_text(self, text: str, phrase: str) -> bool:
+        phrase_norm = re.sub(r'\s+', ' ', phrase.lower()).strip()
+        if not phrase_norm:
+            return False
+        if phrase_norm in text:
+            return True
+        words = [w for w in phrase_norm.split() if len(w) > 2]
+        if len(words) >= 2 and all(w in text for w in words):
+            return True
+        return False
+
+    def _local_scan(self, resume_text: str, jd_text: str) -> dict:
+        resume_norm = re.sub(r'\s+', ' ', resume_text.lower())
+        keywords = self._extract_keywords(jd_text)
+        matched_keywords = []
+        missing_keywords = []
+
+        for keyword in keywords:
+            if self._phrase_in_text(resume_norm, keyword):
+                matched_keywords.append(keyword)
+            else:
+                missing_keywords.append(keyword)
+
+        score = 0
+        if keywords:
+            score = round(len(matched_keywords) / len(keywords) * 100)
+
+        logger.info(f"Local fallback score={score}, matched={len(matched_keywords)}, missing={len(missing_keywords)}")
+
+        return {
+            "score": score,
+            "matched_keywords": matched_keywords,
+            "missing_keywords": missing_keywords,
+            "error": None
+        }
 
     async def _do_scan(self, resume_text: str, jd_text: str, _retry: int = 0) -> dict:
         if _retry >= 5:
@@ -231,13 +468,17 @@ class ATSScanner:
             clicked = False
             for selector in [
                 "button:has-text('New Scan')",
+                "button:has-text('New scan')",
                 "a:has-text('New Scan')",
+                "a:has-text('New scan')",
                 "text=New Scan",
+                "text=New scan",
                 "button[name='New Scan']",
+                "button[type=button] >> text=New Scan"
             ]:
                 try:
                     el = page.locator(selector).first
-                    if await el.is_visible(timeout=2000):
+                    if await el.count() and await el.is_visible(timeout=2000):
                         await el.click()
                         clicked = True
                         logger.info(f"Clicked: {selector}")
@@ -251,8 +492,8 @@ class ATSScanner:
             current_url = page.url
             logger.info(f"URL after click: {current_url}")
 
-            # If redirected to subscription page, this account has no scans — rotate
-            if "subscription" in current_url:
+            page_text = await page.evaluate("() => document.body.innerText")
+            if self._detect_subscription_page(current_url, page_text):
                 logger.warning("Redirected to subscription — account out of scans, rotating...")
                 try:
                     await page.close()
@@ -277,45 +518,36 @@ class ATSScanner:
                         "score": 0, "matched_keywords": [], "missing_keywords": [],
                         "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
                     }
-                # Restart scan with new account
                 return await self._do_scan(resume_text, jd_text, _retry=_retry+1)
 
             # Detect what kind of input the modal uses
             html = await page.content()
-            has_contenteditable = 'contenteditable="true"' in html
+            has_contenteditable = 'contenteditable="true"' in html or 'contenteditable=' in html
             has_prosemirror = 'ProseMirror' in html
             has_textarea = '<textarea' in html
             logger.info(f"contenteditable={has_contenteditable} ProseMirror={has_prosemirror} textarea={has_textarea}")
 
-            if has_prosemirror or has_contenteditable:
-                # Wait for the editor boxes
-                await page.wait_for_selector('.ProseMirror, div[contenteditable="true"]', timeout=15000)
+            if has_prosemirror or has_contenteditable or has_textarea:
                 await asyncio.sleep(1)
-                editors = page.locator('.ProseMirror, div[contenteditable="true"]')
-                count = await editors.count()
-                logger.info(f"Found {count} editor boxes")
+                fields = await self._collect_editor_fields(page)
+                if not fields:
+                    raise Exception("No fillable fields found in scan form")
 
-                jd_box = editors.nth(0)
-                await jd_box.scroll_into_view_if_needed()
-                await jd_box.click()
-                await asyncio.sleep(0.3)
-                await page.keyboard.type(jd_text, delay=5)
-                logger.info("JD filled.")
+                pair = self._match_field_order(fields)
+                if pair is None or len(fields) < 2:
+                    raise Exception("Unable to determine scan input fields")
 
-                resume_box = editors.nth(1)
-                await resume_box.scroll_into_view_if_needed()
-                await resume_box.click()
-                await asyncio.sleep(0.3)
-                await page.keyboard.type(resume_text, delay=5)
+                resume_index, jd_index = pair
+                if resume_index >= len(fields) or jd_index >= len(fields):
+                    raise Exception("Scan form fields are fewer than expected")
+
+                resume_field, _ = fields[resume_index]
+                jd_field, _ = fields[jd_index]
+
+                await self._set_field_text(resume_field, resume_text)
                 logger.info("Resume filled.")
-
-            elif has_textarea:
-                await page.wait_for_selector('textarea', timeout=15000)
-                textareas = page.locator('textarea')
-                await textareas.nth(0).fill(jd_text)
-                await textareas.nth(1).fill(resume_text)
-                logger.info("Filled via textarea.")
-
+                await self._set_field_text(jd_field, jd_text)
+                logger.info("JD filled.")
             else:
                 raise Exception(f"No input found on page. URL={current_url}")
 
@@ -331,8 +563,12 @@ class ATSScanner:
                     continue
             logger.info("Scan submitted — waiting for results page...")
 
-            # Wait for /scans/<uuid>
-            await page.wait_for_url("**/scans/**", timeout=60000)
+            try:
+                await page.wait_for_url("**/scans/**", timeout=90000)
+            except Exception:
+                logger.info("Scan results URL not detected; waiting for result contents instead.")
+                await self._wait_for_scan_results(page)
+
             await asyncio.sleep(3)
             logger.info(f"Results at: {page.url}")
 

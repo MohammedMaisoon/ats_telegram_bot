@@ -89,8 +89,8 @@ async def receive_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Plain text file ──────────────────────────────────
         elif mime.startswith("text/") or doc.file_name.endswith(".txt"):
-            if doc.file_size > 500_000:
-                await update.message.reply_text("❌ File too large. Please paste resume as text.")
+            if doc.file_size > 2_000_000:
+                await update.message.reply_text("❌ File too large. Please paste resume as text or send a smaller .txt file.")
                 return WAITING_RESUME
             file = await doc.get_file()
             file_bytes = await file.download_as_bytearray()
@@ -124,9 +124,41 @@ async def receive_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════
 #  JD Handler — Run the ATS scan!
 # ════════════════════════════════════════════════════════════
+async def _extract_text_from_message(message):
+    content = ""
+    if message.document:
+        doc = message.document
+        mime = doc.mime_type or ""
+        if mime == "application/pdf" or doc.file_name.endswith(".pdf"):
+            file = await doc.get_file()
+            file_bytes = await file.download_as_bytearray()
+            try:
+                pdf = fitz.open(stream=bytes(file_bytes), filetype="pdf")
+                for page in pdf:
+                    content += page.get_text()
+                pdf.close()
+            except Exception as e:
+                raise ValueError(f"Could not read PDF. Try sending text or a .txt file. Error: {e}")
+        elif mime.startswith("text/") or doc.file_name.endswith(".txt"):
+            if doc.file_size > 2_000_000:
+                raise ValueError("Text file too large. Please send a smaller .txt file or paste the JD as text.")
+            file = await doc.get_file()
+            file_bytes = await file.download_as_bytearray()
+            content = file_bytes.decode("utf-8", errors="ignore")
+        else:
+            raise ValueError("Please send a PDF or text file.")
+    elif message.text:
+        content = message.text
+    return content
+
+
 async def receive_jd_and_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    jd_text = update.message.text
+    try:
+        jd_text = await _extract_text_from_message(update.message)
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return WAITING_JD
 
     if len(jd_text.strip()) < 50:
         await update.message.reply_text("❌ JD too short. Please send the full job description.")
@@ -231,7 +263,10 @@ def main():
                 )
             ],
             WAITING_JD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_jd_and_scan)
+                MessageHandler(
+                    (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND,
+                    receive_jd_and_scan
+                )
             ],
         },
         fallbacks=[
