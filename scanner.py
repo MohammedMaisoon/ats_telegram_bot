@@ -7,6 +7,7 @@ import os
 import json
 import asyncio
 import logging
+import shutil
 from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
@@ -78,10 +79,22 @@ class ATSScanner:
         5. Extract score + all keywords
         """
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-            )
+            browser = None
+            args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            try:
+                browser = await p.chromium.launch(headless=True, args=args)
+            except Exception as e:
+                logger.warning(f"Default Chromium launch failed: {e}")
+                chrome_path = self._find_chrome_executable()
+                if chrome_path:
+                    logger.info(f"Trying explicit Chrome executable: {chrome_path}")
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        executable_path=chrome_path,
+                        args=args,
+                    )
+                else:
+                    raise
 
             try:
                 # ── Build context with cookies ───────────────
@@ -146,6 +159,35 @@ class ATSScanner:
                 except:
                     pass
                 return {"error": str(e)}
+
+    # ════════════════════════════════════════════════════════
+    #  BROWSER HELPERS
+    # ════════════════════════════════════════════════════════
+
+    def _find_chrome_executable(self) -> str | None:
+        paths = [
+            os.environ.get("CHROME_PATH"),
+            os.environ.get("GOOGLE_CHROME_BIN"),
+            os.environ.get("CHROME_BIN"),
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome-beta",
+            "/usr/bin/google-chrome-unstable",
+            "/usr/bin/chrome",
+        ]
+        for path in paths:
+            if path and os.path.exists(path):
+                return path
+
+        for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"]:
+            found = shutil.which(name)
+            if found:
+                return found
+
+        return None
 
     # ════════════════════════════════════════════════════════
     #  LOGIN (master account only)
@@ -346,7 +388,7 @@ class ATSScanner:
                     if (parent) {
                         const allSpans = parent.querySelectorAll('*');
                         allSpans.forEach(el => {
-                            if (el.textContent.match(/^\d+%$/)) {
+                            if (el.textContent.match(/^\\d+%$/)) {
                                 result.hard_skills_score = el.textContent.trim();
                             }
                         });
@@ -357,7 +399,7 @@ class ATSScanner:
                     if (parent) {
                         const allSpans = parent.querySelectorAll('*');
                         allSpans.forEach(el => {
-                            if (el.textContent.match(/^\d+%$/)) {
+                            if (el.textContent.match(/^\\d+%$/)) {
                                 result.soft_skills_score = el.textContent.trim();
                             }
                         });
