@@ -251,27 +251,36 @@ class ATSScanner:
             await locator.fill(text)
             return
 
-        await locator.evaluate(
-            "(el, value) => {"
-            "  el.focus();"
-            "  if ('value' in el) el.value = value;"
-            "  if ('innerText' in el) el.innerText = value;"
-            "  el.textContent = value;"
-            "  el.dispatchEvent(new InputEvent('input', { bubbles: true }));"
-            "  el.dispatchEvent(new Event('change', { bubbles: true }));"
-            "}",
-            text
-        )
-        await asyncio.sleep(0.1)
+        try:
+            await locator.fill(text)
+            return
+        except Exception:
+            pass
+
+        await locator.click()
+        try:
+            await locator.press("Control+A")
+        except Exception:
+            pass
+        await locator.type(text, delay=5)
+        await asyncio.sleep(0.2)
 
     async def _collect_editor_fields(self, page):
         fields = []
-        editors = page.locator('.ProseMirror, div[contenteditable="true"], textarea')
+        editors = page.locator('.ProseMirror, div[contenteditable="true"], textarea, div[role="textbox"]')
         count = await editors.count()
         for idx in range(count):
             locator = editors.nth(idx)
             hint = await locator.evaluate(
                 "el => {"
+                "  const label = el.closest('label');"
+                "  if (label && label.textContent) return label.textContent.trim();"
+                "  if (el.getAttribute) {"
+                "    const aria = el.getAttribute('aria-label');"
+                "    if (aria) return aria.trim();"
+                "    const placeholder = el.getAttribute('placeholder');"
+                "    if (placeholder) return placeholder.trim();"
+                "  }"
                 "  let node = el;"
                 "  while (node) {"
                 "    if (node.previousElementSibling && node.previousElementSibling.textContent) {"
@@ -307,9 +316,9 @@ class ATSScanner:
         return page.wait_for_function(
             "() => {"
             "  const text = document.body.innerText.toLowerCase();"
-            "  return /match rate|score|result|matched keywords|missing keywords|your score/.test(text);"
+            "  return /(match rate|score|result|matched keywords|missing keywords|your score|\\d{1,3}\\s*%|ats score|match score)/.test(text);"
             "}",
-            timeout=90000
+            timeout=45000
         )
 
     def _extract_keywords(self, text: str) -> list[str]:
@@ -552,10 +561,20 @@ class ATSScanner:
                 raise Exception(f"No input found on page. URL={current_url}")
 
             # Click Scan submit button
-            for sel in ["button:has-text('Scan')", "button[name='Scan']", "button[type='submit']"]:
+            for sel in [
+                "button:has-text('Scan')",
+                "button:has-text('Start scan')",
+                "button:has-text('Start Scan')",
+                "button:has-text('Analyze')",
+                "button:has-text('Analyze Resume')",
+                "button:has-text('Get ATS Score')",
+                "button[name='Scan']",
+                "button[type='submit']",
+                "button:has-text('Submit')"
+            ]:
                 try:
                     btn = page.locator(sel).first
-                    if await btn.is_visible(timeout=2000):
+                    if await btn.count() and await btn.is_visible(timeout=2000):
                         await btn.click()
                         logger.info(f"Scan submitted via: {sel}")
                         break
