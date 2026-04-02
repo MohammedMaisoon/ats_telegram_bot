@@ -1,650 +1,370 @@
 """
-ATS Scanner — uses SkillSyncer via Playwright browser automation.
-Exposes ATSScanner class with async scan() method to match bot.py usage.
+scanner.py — Playwright ATS Scanner with EXACT locators from SkillSyncer
+All selectors verified live on app.skillsyncer.com
 """
 
+import os
+import json
 import asyncio
 import logging
-import os
-import re
-import shutil
-from collections import Counter
-
 from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
-# Account pool — rotates when one runs out of scans
-_DEFAULT_PASSWORD = os.environ.get("MASTER_PASSWORD", "ski!!@123")
-ACCOUNTS = [
-    {"email": os.environ.get("MASTER_EMAIL", "maisoonmohammed23@gmail.com"), "password": _DEFAULT_PASSWORD},
-    {"email": "mohammedmaisoon24@gmail.com", "password": _DEFAULT_PASSWORD},
-    {"email": "mohammedmaisoon22@gmail.com", "password": _DEFAULT_PASSWORD},
-    {"email": "hmoideenbasha@gmail.com",     "password": _DEFAULT_PASSWORD},
-    {"email": "mdmaisoon23@gmail.com",       "password": _DEFAULT_PASSWORD},
-]
-MASTER_EMAIL    = ACCOUNTS[0]["email"]
-MASTER_PASSWORD = ACCOUNTS[0]["password"]
+# ── Confirmed URLs ───────────────────────────────────────────
+LOGIN_URL     = "https://skillsyncer.com/login"
+DASHBOARD_URL = "https://app.skillsyncer.com/dashboard"
 
-# System Chromium installed by apt-get in Dockerfile
-CHROMIUM_PATHS = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-]
+# ════════════════════════════════════════════════════════════
+#  EXACT LOCATORS — verified live from SkillSyncer
+# ════════════════════════════════════════════════════════════
 
-def _find_chromium() -> str | None:
-    """Return path to system Chromium binary."""
-    for path in CHROMIUM_PATHS:
-        if os.path.exists(path):
-            logger.info(f"Found system Chromium: {path}")
-            return path
-    # fallback: search PATH
-    found = shutil.which("chromium") or shutil.which("chromium-browser")
-    if found:
-        logger.info(f"Found Chromium via PATH: {found}")
-        return found
-    logger.warning("No system Chromium found — letting Playwright use its own.")
-    return None
+# LOGIN PAGE
+LOCATOR_EMAIL          = 'input[autocomplete="off"][type="text"]'   # email textbox
+LOCATOR_PASSWORD       = 'input[type="password"]'                   # password textbox
+LOCATOR_SIGNIN_BTN     = 'button:has-text("Sign In")'               # Sign In button
+
+# DASHBOARD — NEW SCAN MODAL trigger
+LOCATOR_NEW_SCAN_BTN   = 'button:has-text("New Scan")'              # sidebar New Scan
+
+# NEW SCAN MODAL FIELDS
+LOCATOR_COMPANY_INPUT  = 'input[placeholder="Amazon"]'              # Company Name input
+LOCATOR_JOBTITLE_INPUT = 'input[placeholder="Project Manager"]'     # Job Title input
+LOCATOR_JD_EDITOR      = '.ProseMirror >> nth=0'                    # Job Description rich text
+LOCATOR_RESUME_EDITOR  = '.ProseMirror >> nth=1'                    # Resume rich text
+LOCATOR_SCAN_BTN       = 'button:has-text("Scan"):not(:has-text("New Scan")):not(:has-text("Create Scan"))'
+
+# RESULTS PAGE — SCORE
+# Verified: <span class="font-bold tracking-tighter leading-none items-center transition duration-100 text-4xl">77</span>
+# Inside: <div class="percent flex flex-1 items-center justify-center">
+# Inside: <div class="circle">
+LOCATOR_SCORE          = 'span.font-bold.tracking-tighter.leading-none'
+LOCATOR_SCORE_PARENT   = 'div.percent'
+LOCATOR_SCORE_CIRCLE   = 'div.circle'
+
+# RESULTS PAGE — KEYWORDS TABLE
+# Verified: <table> with <tbody> containing <tr class="monitor"> rows
+LOCATOR_KW_TABLE       = 'table'
+LOCATOR_KW_ROWS        = 'table tbody tr'
+LOCATOR_KW_NAME        = 'td:nth-child(1) button'                   # keyword name button
+LOCATOR_KW_TYPE        = 'td:nth-child(2)'                          # Hard / Soft / Other
+LOCATOR_KW_SCORE_CELL  = 'td:nth-child(3)'                          # percentage cell (next sibling after role=cell)
+
+# RESULTS PAGE — MISSING KEYWORDS BADGES (from report cards)
+# Verified: <span class="bg-green-200 text-green-800 ... cursor-pointer">keyword</span>
+# These are the clickable keyword badges in the report section
+LOCATOR_MISSING_BADGES = 'span.bg-green-200.text-green-800'
+
+# RESULTS PAGE — SCORE SECTIONS
+LOCATOR_HARD_SKILLS_PCT  = 'h3:has-text("Hard Skills") ~ * [class*="percent"], h3:has-text("Hard Skills") + *'
+LOCATOR_SOFT_SKILLS_PCT  = 'h3:has-text("Soft Skills") ~ * [class*="percent"]'
 
 
 class ATSScanner:
-    """
-    Singleton-style scanner. Reuses one browser + logged-in session
-    across all Telegram users.
-    """
 
-    def __init__(self):
-        self._playwright    = None
-        self._browser       = None
-        self._context       = None
-        self._lock          = asyncio.Lock()
-        self._account_index = 0   # which account we are currently using
-
-    async def _start_browser(self):
-        if self._playwright is None:
-            self._playwright = await async_playwright().start()
-
-        if self._browser is None or not self._browser.is_connected():
-            chromium_path = _find_chromium()
-            launch_kwargs = dict(
+    async def scan(
+        self,
+        resume_text: str,
+        jd_text: str,
+        cookies: list = None,
+        user_id: int = None,
+    ) -> dict:
+        """
+        Full scan flow:
+        1. Load session (cookies or master login)
+        2. Open New Scan modal
+        3. Fill Company, Job Title, JD, Resume
+        4. Click Scan
+        5. Extract score + all keywords
+        """
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process",
-                    "--no-zygote",
-                ]
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
             )
-            if chromium_path:
-                launch_kwargs["executable_path"] = chromium_path
-
-            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-            logger.info("Browser launched successfully.")
-
-    async def _login(self, account=None):
-        if self._context:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-            self._context = None
-
-        if account is None:
-            account = ACCOUNTS[self._account_index]
-
-        await self._start_browser()
-        self._context = await self._browser.new_context()
-        page = await self._context.new_page()
-        try:
-            logger.info(f"Logging in as {account['email']}...")
-            await page.goto(
-                "https://skillsyncer.com/login",
-                wait_until="domcontentloaded",
-                timeout=30000
-            )
-
-            email_input = None
-            password_input = None
-            sign_in_button = None
-
-            # Robust email field selection
-            for selector in [
-                "input[type=email]",
-                "input[name*=email]",
-                "input[placeholder*='Email']",
-                "input[placeholder*='email']",
-                "input[id*=email]",
-                "input[class*=email]"
-            ]:
-                try:
-                    el = page.locator(selector).first
-                    if await el.count() and await el.is_visible(timeout=2000):
-                        email_input = el
-                        break
-                except Exception:
-                    continue
-
-            if email_input is None:
-                email_input = page.get_by_role("textbox", name=re.compile("email", re.I))
-
-            # Robust password field selection
-            for selector in [
-                "input[type=password]",
-                "input[name*=password]",
-                "input[placeholder*='Password']",
-                "input[id*=password]",
-                "input[class*=password]"
-            ]:
-                try:
-                    el = page.locator(selector).first
-                    if await el.count() and await el.is_visible(timeout=2000):
-                        password_input = el
-                        break
-                except Exception:
-                    continue
-
-            if password_input is None:
-                password_input = page.get_by_role("textbox", name=re.compile("password", re.I))
-
-            # Robust sign-in button selection
-            for selector in [
-                "button:has-text('Sign In')",
-                "button:has-text('Sign in')",
-                "button[type=submit]",
-                "button:has-text('Login')",
-                "button:has-text('Log In')"
-            ]:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.count() and await btn.is_visible(timeout=2000):
-                        sign_in_button = btn
-                        break
-                except Exception:
-                    continue
-
-            if email_input is None or password_input is None or sign_in_button is None:
-                raise Exception("Login form not found")
-
-            await email_input.fill(account["email"])
-            await password_input.fill(account["password"])
-            await sign_in_button.click()
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await page.wait_for_url("**/dashboard", timeout=30000)
-            logger.info(f"Login successful: {account['email']}")
-            return True
-        except Exception as e:
-            logger.error(f"Login failed for {account['email']}: {e}")
-            self._context = None
-            return False
-        finally:
-            await page.close()
-
-    async def _login_next_account(self):
-        """Try each account in the pool until one works and has scans."""
-        for i in range(len(ACCOUNTS)):
-            idx = (self._account_index + i) % len(ACCOUNTS)
-            account = ACCOUNTS[idx]
-            logger.info(f"Trying account {idx+1}/{len(ACCOUNTS)}: {account['email']}")
-
-            # Fully reset browser + context before each attempt
-            if self._context:
-                try:
-                    await self._context.close()
-                except Exception:
-                    pass
-                self._context = None
-            if self._browser:
-                try:
-                    await self._browser.close()
-                except Exception:
-                    pass
-                self._browser = None
-
-            ok = await self._login(account)
-            if not ok:
-                continue
-            scans = await self._scans_remaining()
-            if scans > 0:
-                self._account_index = idx
-                logger.info(f"Using account: {account['email']} ({scans} scans left)")
-                return True
-            else:
-                logger.warning(f"Account {account['email']} has 0 scans — trying next")
-        logger.error("All accounts exhausted — no scans available")
-        return False
-
-    async def _scans_remaining(self) -> int:
-        page = await self._context.new_page()
-        try:
-            await page.goto(
-                "https://app.skillsyncer.com/dashboard",
-                wait_until="domcontentloaded",
-                timeout=20000
-            )
-            text = await page.evaluate("() => document.body.innerText")
-            match = re.search(r'Scans\s*Left[:\s]+(\d+)', text, re.IGNORECASE)
-            if not match:
-                match = re.search(r'(\d+)\s+scans?\s+left', text, re.IGNORECASE)
-            if not match:
-                match = re.search(r'(\d+)\s+remaining', text, re.IGNORECASE)
-            count = int(match.group(1)) if match else 1
-            logger.info(f"Scans remaining: {count}")
-            return count
-        except Exception as e:
-            logger.warning(f"Could not read scan count: {e}")
-            return 1
-        finally:
-            await page.close()
-
-    async def scan(self, resume_text: str, jd_text: str,
-                   cookies=None, user_id=None) -> dict:
-        async with self._lock:
-            return await self._do_scan(resume_text, jd_text)
-
-    async def _set_field_text(self, locator, text: str):
-        tag = await locator.evaluate("el => el.tagName.toLowerCase()")
-        if tag in ("textarea", "input"):
-            await locator.fill(text)
-            return
-
-        try:
-            await locator.fill(text)
-            return
-        except Exception:
-            pass
-
-        await locator.click()
-        try:
-            await locator.press("Control+A")
-        except Exception:
-            pass
-        await locator.type(text, delay=5)
-        await asyncio.sleep(0.2)
-
-    async def _collect_editor_fields(self, page):
-        fields = []
-        editors = page.locator('.ProseMirror, div[contenteditable="true"], textarea, div[role="textbox"]')
-        count = await editors.count()
-        for idx in range(count):
-            locator = editors.nth(idx)
-            hint = await locator.evaluate(
-                "el => {"
-                "  const label = el.closest('label');"
-                "  if (label && label.textContent) return label.textContent.trim();"
-                "  if (el.getAttribute) {"
-                "    const aria = el.getAttribute('aria-label');"
-                "    if (aria) return aria.trim();"
-                "    const placeholder = el.getAttribute('placeholder');"
-                "    if (placeholder) return placeholder.trim();"
-                "  }"
-                "  let node = el;"
-                "  while (node) {"
-                "    if (node.previousElementSibling && node.previousElementSibling.textContent) {"
-                "      const text = node.previousElementSibling.textContent.trim();"
-                "      if (text) return text;"
-                "    }"
-                "    node = node.parentElement;"
-                "  }"
-                "  return '';"
-                "}"
-            )
-            fields.append((locator, hint.lower() if hint else ""))
-        return fields
-
-    def _match_field_order(self, fields):
-        if len(fields) < 2:
-            return None
-
-        hints = [hint for _, hint in fields]
-        if any("resume" in hint for hint in hints) and any("job" in hint or "description" in hint for hint in hints):
-            resume_index = next(i for i, h in enumerate(hints) if "resume" in h)
-            jd_index = next(i for i, h in enumerate(hints) if "job" in h or "description" in h)
-            return resume_index, jd_index
-        return 0, 1
-
-    def _detect_subscription_page(self, page_url: str, text: str) -> bool:
-        if "subscription" in page_url or "billing" in page_url or "payment" in page_url:
-            return True
-        lower = text.lower()
-        return "subscription" in lower or "upgrade" in lower or "billing" in lower or "paid plan" in lower
-
-    def _wait_for_scan_results(self, page):
-        return page.wait_for_function(
-            "() => {"
-            "  const text = document.body.innerText.toLowerCase();"
-            "  return /(match rate|score|result|matched keywords|missing keywords|your score|\\d{1,3}\\s*%|ats score|match score)/.test(text);"
-            "}",
-            timeout=45000
-        )
-
-    def _extract_keywords(self, text: str) -> list[str]:
-        cleaned = re.sub(r'[\r\n]+', ' ', text)
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-
-        stopwords = {
-            'and', 'or', 'the', 'for', 'with', 'from', 'that', 'this', 'these', 'those',
-            'will', 'have', 'has', 'your', 'you', 'are', 'is', 'in', 'on', 'to', 'of',
-            'a', 'an', 'as', 'be', 'by', 'at', 'we', 'our', 'us', 'may', 'also', 'can',
-            'experience', 'skills', 'skill', 'work', 'team', 'requirements', 'required',
-            'responsibilities', 'including', 'demonstrated', 'ability', 'strong', 'years',
-            'experience', 'using', 'business', 'technical', 'knowledge', 'candidate'
-        }
-
-        # Use meaningful JD lines first
-        lines = []
-        for raw_line in text.splitlines():
-            line = raw_line.strip(' -•*\t')
-            if not line:
-                continue
-            if len(line) > 100:
-                parts = re.split(r'[,:;] +', line)
-                for part in parts:
-                    part = part.strip()
-                    if 15 <= len(part) <= 90:
-                        lines.append(part)
-            else:
-                lines.append(line)
-
-        candidates = []
-        for line in lines:
-            lower = line.lower()
-            if len(line.split()) >= 3 and any(term in lower for term in [
-                'experience', 'experience with', 'familiar', 'knowledge of',
-                'responsibilities', 'required', 'strong', 'prefer', 'must have',
-                'ability to', 'work with', 'manage', 'design', 'build', 'develop'
-            ]):
-                candidates.append(re.sub(r'[\.:;]+$', '', line).strip())
-
-        words = re.findall(r"[A-Za-z0-9+#]+", text)
-        freq = Counter(
-            w.lower() for w in words
-            if len(w) > 2 and w.lower() not in stopwords and not w.isdigit()
-        )
-        for word, _ in freq.most_common(40):
-            if word not in stopwords and word not in {c.lower() for c in candidates}:
-                candidates.append(word)
-            if len(candidates) >= 30:
-                break
-
-        cleaned_keywords = []
-        seen = set()
-        for item in candidates:
-            item_norm = re.sub(r'\s+', ' ', item).strip()
-            if len(item_norm) < 3:
-                continue
-            key = item_norm.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned_keywords.append(item_norm)
-            if len(cleaned_keywords) >= 30:
-                break
-
-        return cleaned_keywords
-
-    def _phrase_in_text(self, text: str, phrase: str) -> bool:
-        phrase_norm = re.sub(r'\s+', ' ', phrase.lower()).strip()
-        if not phrase_norm:
-            return False
-        if phrase_norm in text:
-            return True
-        words = [w for w in phrase_norm.split() if len(w) > 2]
-        if len(words) >= 2 and all(w in text for w in words):
-            return True
-        return False
-
-    def _local_scan(self, resume_text: str, jd_text: str) -> dict:
-        resume_norm = re.sub(r'\s+', ' ', resume_text.lower())
-        keywords = self._extract_keywords(jd_text)
-        matched_keywords = []
-        missing_keywords = []
-
-        for keyword in keywords:
-            if self._phrase_in_text(resume_norm, keyword):
-                matched_keywords.append(keyword)
-            else:
-                missing_keywords.append(keyword)
-
-        score = 0
-        if keywords:
-            score = round(len(matched_keywords) / len(keywords) * 100)
-
-        logger.info(f"Local fallback score={score}, matched={len(matched_keywords)}, missing={len(missing_keywords)}")
-
-        return {
-            "score": score,
-            "matched_keywords": matched_keywords,
-            "missing_keywords": missing_keywords,
-            "error": None
-        }
-
-    async def _do_scan(self, resume_text: str, jd_text: str, _retry: int = 0) -> dict:
-        if _retry >= 5:
-            return {"score": 0, "matched_keywords": [], "missing_keywords": [], "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"}
-        # Ensure we have a logged-in session with scans available
-        if self._context is None:
-            logger.info("No session — finding account with scans...")
-            ok = await self._login_next_account()
-            if not ok:
-                return {
-                    "score": 0, "matched_keywords": [], "missing_keywords": [],
-                    "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
-                }
-        else:
-            logger.info("Reusing existing session.")
-
-        # Check scans remaining — if 0, rotate to next account
-        remaining = await self._scans_remaining()
-        if remaining == 0:
-            logger.warning("Current account has 0 scans — rotating to next account...")
-            if self._context:
-                try:
-                    await self._context.close()
-                except Exception:
-                    pass
-                self._context = None
-            if self._browser:
-                try:
-                    await self._browser.close()
-                except Exception:
-                    pass
-                self._browser = None
-            self._account_index = (self._account_index + 1) % len(ACCOUNTS)
-            ok = await self._login_next_account()
-            if not ok:
-                return {
-                    "score": 0, "matched_keywords": [], "missing_keywords": [],
-                    "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
-                }
-
-        page = await self._context.new_page()
-        try:
-            await page.goto(
-                "https://app.skillsyncer.com/dashboard",
-                wait_until="domcontentloaded",
-                timeout=20000
-            )
-
-            # Open New Scan modal
-            logger.info("Clicking New Scan button...")
-            await page.wait_for_load_state("networkidle", timeout=10000)
-
-            # Try multiple selectors for the New Scan button
-            clicked = False
-            for selector in [
-                "button:has-text('New Scan')",
-                "button:has-text('New scan')",
-                "a:has-text('New Scan')",
-                "a:has-text('New scan')",
-                "text=New Scan",
-                "text=New scan",
-                "button[name='New Scan']",
-                "button[type=button] >> text=New Scan"
-            ]:
-                try:
-                    el = page.locator(selector).first
-                    if await el.count() and await el.is_visible(timeout=2000):
-                        await el.click()
-                        clicked = True
-                        logger.info(f"Clicked: {selector}")
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                raise Exception("Could not find New Scan button")
-
-            await asyncio.sleep(4)
-            current_url = page.url
-            logger.info(f"URL after click: {current_url}")
-
-            page_text = await page.evaluate("() => document.body.innerText")
-            if self._detect_subscription_page(current_url, page_text):
-                logger.warning("Redirected to subscription — account out of scans, rotating...")
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-                if self._context:
-                    try:
-                        await self._context.close()
-                    except Exception:
-                        pass
-                    self._context = None
-                if self._browser:
-                    try:
-                        await self._browser.close()
-                    except Exception:
-                        pass
-                    self._browser = None
-                self._account_index = (self._account_index + 1) % len(ACCOUNTS)
-                ok = await self._login_next_account()
-                if not ok:
-                    return {
-                        "score": 0, "matched_keywords": [], "missing_keywords": [],
-                        "error": "All SkillSyncer accounts are out of scans. Resets every Sunday!"
-                    }
-                return await self._do_scan(resume_text, jd_text, _retry=_retry+1)
-
-            # Detect what kind of input the modal uses
-            html = await page.content()
-            has_contenteditable = 'contenteditable="true"' in html or 'contenteditable=' in html
-            has_prosemirror = 'ProseMirror' in html
-            has_textarea = '<textarea' in html
-            logger.info(f"contenteditable={has_contenteditable} ProseMirror={has_prosemirror} textarea={has_textarea}")
-
-            if has_prosemirror or has_contenteditable or has_textarea:
-                await asyncio.sleep(1)
-                fields = await self._collect_editor_fields(page)
-                if not fields:
-                    raise Exception("No fillable fields found in scan form")
-
-                pair = self._match_field_order(fields)
-                if pair is None or len(fields) < 2:
-                    raise Exception("Unable to determine scan input fields")
-
-                resume_index, jd_index = pair
-                if resume_index >= len(fields) or jd_index >= len(fields):
-                    raise Exception("Scan form fields are fewer than expected")
-
-                resume_field, _ = fields[resume_index]
-                jd_field, _ = fields[jd_index]
-
-                await self._set_field_text(resume_field, resume_text)
-                logger.info("Resume filled.")
-                await self._set_field_text(jd_field, jd_text)
-                logger.info("JD filled.")
-            else:
-                raise Exception(f"No input found on page. URL={current_url}")
-
-            # Click Scan submit button
-            for sel in [
-                "button:has-text('Scan')",
-                "button:has-text('Start scan')",
-                "button:has-text('Start Scan')",
-                "button:has-text('Analyze')",
-                "button:has-text('Analyze Resume')",
-                "button:has-text('Get ATS Score')",
-                "button[name='Scan']",
-                "button[type='submit']",
-                "button:has-text('Submit')"
-            ]:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.count() and await btn.is_visible(timeout=2000):
-                        await btn.click()
-                        logger.info(f"Scan submitted via: {sel}")
-                        break
-                except Exception:
-                    continue
-            logger.info("Scan submitted — waiting for results page...")
 
             try:
-                await page.wait_for_url("**/scans/**", timeout=90000)
-            except Exception:
-                logger.info("Scan results URL not detected; waiting for result contents instead.")
-                await self._wait_for_scan_results(page)
+                # ── Build context with cookies ───────────────
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    )
+                )
 
-            await asyncio.sleep(3)
-            logger.info(f"Results at: {page.url}")
-
-            page_text = await page.evaluate("() => document.body.innerText")
-
-            # Extract score
-            score = None
-            m = re.search(
-                r'computed match rate is[^\d]*(\d+)|'
-                r'match rate[^\d]*(\d+)|'
-                r'Your.*?score.*?(\d+)%',
-                page_text, re.IGNORECASE
-            )
-            if m:
-                score = int(next(g for g in m.groups() if g is not None))
-                logger.info(f"Score from match text: {score}")
-            else:
-                numbers = re.findall(r'\b(\d{1,3})\b', page_text[:2000])
-                for n in numbers:
-                    n_int = int(n)
-                    if 0 <= n_int <= 100:
-                        score = n_int
-                        logger.info(f"Score fallback: {score}")
-                        break
-
-            if score is None:
-                score = 0
-
-            # Extract keywords from results table
-            matched_keywords = []
-            missing_keywords = []
-            rows = re.findall(
-                r'([A-Za-z][A-Za-z ]{1,35}?)\s{2,}(?:Hard|Soft|Other)\s+(\d+)%\s+\d+\s+\d+',
-                page_text
-            )
-            for keyword, pct in rows:
-                keyword = keyword.strip()
-                if int(pct) > 0:
-                    matched_keywords.append(keyword)
+                if cookies:
+                    # User's own cookies — inject directly
+                    await context.add_cookies(cookies)
+                    logger.info(f"Injected cookies for user {user_id}")
                 else:
-                    missing_keywords.append(keyword)
+                    # Try master session file
+                    master_session = os.getenv("MASTER_SESSION_PATH", "master_session.json")
+                    if os.path.exists(master_session):
+                        await context.close()
+                        context = await browser.new_context(
+                            storage_state=master_session,
+                            user_agent=(
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                            )
+                        )
+                        logger.info("Loaded master session")
+                    else:
+                        # Fresh master login
+                        page = await context.new_page()
+                        login_ok = await self._login(page)
+                        if not login_ok:
+                            await browser.close()
+                            return {"error": "Master login failed"}
+                        await context.storage_state(path="master_session.json")
+                        logger.info("Master session saved")
+                        await page.close()
 
-            logger.info(f"Done → score={score}, matched={len(matched_keywords)}, missing={len(missing_keywords)}")
+                page = await context.new_page()
 
-            return {
-                "score": score,
-                "matched_keywords": matched_keywords,
-                "missing_keywords": missing_keywords,
-                "error": None
-            }
+                # ── Verify session is valid ──────────────────
+                await page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+
+                if "login" in page.url:
+                    logger.warning(f"Session expired for user {user_id}")
+                    await browser.close()
+                    return {"error": "session_expired"}
+
+                logger.info(f"On dashboard: {page.url}")
+
+                # ── Run the scan ─────────────────────────────
+                result = await self._do_scan(page, resume_text, jd_text)
+                await browser.close()
+                return result
+
+            except Exception as e:
+                logger.error(f"Scanner error: {e}")
+                try:
+                    await browser.close()
+                except:
+                    pass
+                return {"error": str(e)}
+
+    # ════════════════════════════════════════════════════════
+    #  LOGIN (master account only)
+    # ════════════════════════════════════════════════════════
+    async def _login(self, page) -> bool:
+        email    = os.getenv("MASTER_EMAIL")
+        password = os.getenv("MASTER_PASSWORD")
+
+        if not email or not password:
+            logger.error("MASTER_EMAIL / MASTER_PASSWORD not in .env")
+            return False
+
+        try:
+            await page.goto(LOGIN_URL, wait_until="networkidle")
+            await asyncio.sleep(1)
+
+            # EXACT: input[autocomplete="off"][type="text"] → email
+            await page.locator('input[autocomplete="off"][type="text"]').fill(email)
+            await asyncio.sleep(0.4)
+
+            # EXACT: input[type="password"] → password
+            await page.locator('input[type="password"]').fill(password)
+            await asyncio.sleep(0.4)
+
+            # EXACT: button "Sign In"
+            await page.get_by_role("button", name="Sign In").click()
+            await page.wait_for_load_state("networkidle")
+            await asyncio.sleep(2)
+
+            if "login" in page.url:
+                logger.error("Login failed — check credentials")
+                return False
+
+            logger.info("Master login successful!")
+            return True
 
         except Exception as e:
-            logger.error(f"Scan error: {e}", exc_info=True)
-            self._context = None  # reset so next call re-logs in fresh
-            return {
-                "score": 0, "matched_keywords": [], "missing_keywords": [],
-                "error": str(e)
+            logger.error(f"Login error: {e}")
+            return False
+
+    # ════════════════════════════════════════════════════════
+    #  FULL SCAN FLOW
+    # ════════════════════════════════════════════════════════
+    async def _do_scan(self, page, resume_text: str, jd_text: str) -> dict:
+        try:
+            # ── Step 1: Click "New Scan" button in sidebar ──
+            # EXACT: button with text "New Scan" ref=e37
+            await page.get_by_role("button", name="New Scan").click()
+            await asyncio.sleep(2)
+            logger.info("New Scan modal opened")
+
+            # ── Step 2: Fill Company Name ────────────────────
+            # EXACT: input[placeholder="Amazon"] — Company Name
+            await page.locator('input[placeholder="Amazon"]').fill("Company")
+            await asyncio.sleep(0.3)
+
+            # ── Step 3: Fill Job Title ───────────────────────
+            # EXACT: input[placeholder="Project Manager"] — Job Title
+            await page.locator('input[placeholder="Project Manager"]').fill("Position")
+            await asyncio.sleep(0.3)
+
+            # ── Step 4: Fill Job Description ─────────────────
+            # EXACT: .ProseMirror nth=0 — rich text editor for JD
+            await page.locator('.ProseMirror').nth(0).click()
+            await asyncio.sleep(0.3)
+            await page.locator('.ProseMirror').nth(0).fill(jd_text)
+            await asyncio.sleep(0.5)
+
+            # ── Step 5: Fill Resume ──────────────────────────
+            # EXACT: .ProseMirror nth=1 — rich text editor for Resume
+            await page.locator('.ProseMirror').nth(1).click()
+            await asyncio.sleep(0.3)
+            await page.locator('.ProseMirror').nth(1).fill(resume_text)
+            await asyncio.sleep(0.5)
+
+            # ── Step 6: Click Scan button ────────────────────
+            # EXACT: button "Scan" exact=True (not New Scan / Create Scan)
+            await page.get_by_role("button", name="Scan", exact=True).click()
+            logger.info("Scan submitted — waiting for results...")
+
+            # ── Step 7: Wait for results page ───────────────
+            await page.wait_for_load_state("networkidle")
+            await asyncio.sleep(5)
+
+            # Confirm we're on scan results URL
+            if "/scans/" not in page.url:
+                logger.warning(f"Unexpected URL after scan: {page.url}")
+                await asyncio.sleep(5)  # wait more
+
+            logger.info(f"Results page: {page.url}")
+
+            # ── Step 8: Close upgrade popup if appears ───────
+            try:
+                close_btn = page.get_by_role("button", name="Close")
+                if await close_btn.is_visible(timeout=3000):
+                    await close_btn.click()
+                    await asyncio.sleep(0.5)
+            except:
+                pass
+
+            # ── Step 9: Extract everything ───────────────────
+            return await self._extract_results(page)
+
+        except Exception as e:
+            logger.error(f"Scan flow error: {e}")
+            # Save debug screenshot
+            try:
+                await page.screenshot(path="debug_scan.png", full_page=True)
+            except:
+                pass
+            return {"error": str(e)}
+
+    # ════════════════════════════════════════════════════════
+    #  EXTRACT RESULTS — EXACT SELECTORS VERIFIED
+    # ════════════════════════════════════════════════════════
+    async def _extract_results(self, page) -> dict:
+        return await page.evaluate("""
+        () => {
+            const result = {
+                score: null,
+                matched_keywords: [],
+                missing_keywords: [],
+                all_keywords: [],
+                hard_skills_score: null,
+                soft_skills_score: null,
+            };
+
+            // ══════════════════════════════════════════
+            //  ATS SCORE
+            //  EXACT: span.font-bold.tracking-tighter.leading-none
+            //  Inside div.percent > div.circle
+            //  Verified value: "77"
+            // ══════════════════════════════════════════
+            const scoreEl = document.querySelector(
+                'span.font-bold.tracking-tighter.leading-none'
+            );
+            if (scoreEl) {
+                result.score = scoreEl.textContent.trim();
             }
-        finally:
-            await page.close()
+
+            // ══════════════════════════════════════════
+            //  KEYWORDS TABLE
+            //  EXACT: table tbody tr  (class="monitor" on each row)
+            //  Columns: [keyword button] [type div] [score td] [resume count] [job count]
+            // ══════════════════════════════════════════
+            const rows = document.querySelectorAll('table tbody tr');
+            rows.forEach(row => {
+                const cells = row.querySelectorAll('td');
+                if (cells.length < 3) return;
+
+                // keyword name — inside button in first td
+                const keywordBtn = cells[0].querySelector('button');
+                const keyword = keywordBtn
+                    ? keywordBtn.textContent.trim()
+                    : cells[0].textContent.trim();
+
+                // type — second td, has a div inside
+                const type = cells[1].textContent.trim();  // "Hard" / "Soft" / "Other"
+
+                // score % — the td after type (index 2 is a [role=cell] for %)
+                // From live page: cells[2] is the score % column
+                const scoreText = cells[2]?.textContent.trim() || '';
+                const scoreNum = parseInt(scoreText.replace('%','')) || 0;
+
+                // resume count & job count
+                const resumeCount = cells[3]?.textContent.trim() || '0';
+                const jobCount    = cells[4]?.textContent.trim() || '0';
+
+                const entry = { keyword, type, score: scoreText, resumeCount, jobCount };
+                result.all_keywords.push(entry);
+
+                // Matched = score > 0% (found in resume)
+                if (scoreNum > 0) {
+                    result.matched_keywords.push(keyword);
+                } else {
+                    // Missing = score 0% (not in resume)
+                    result.missing_keywords.push(keyword);
+                }
+            });
+
+            // ══════════════════════════════════════════
+            //  HARD/SOFT SKILLS SECTION SCORES
+            //  EXACT: heading h3 contains "Hard Skills"
+            //  Score is sibling with class containing percent number
+            // ══════════════════════════════════════════
+            document.querySelectorAll('h3').forEach(h3 => {
+                const text = h3.textContent.trim();
+                const sibling = h3.closest('div')?.querySelector(
+                    '[class*="percent"], [class*="score-text"]'
+                );
+                const pctEl = h3.parentElement?.parentElement?.querySelector(
+                    '*:last-child'
+                );
+
+                if (text === 'Hard Skills') {
+                    // Find the % number next to "Hard Skills" heading
+                    const parent = h3.closest('[class]');
+                    if (parent) {
+                        const allSpans = parent.querySelectorAll('*');
+                        allSpans.forEach(el => {
+                            if (el.textContent.match(/^\d+%$/)) {
+                                result.hard_skills_score = el.textContent.trim();
+                            }
+                        });
+                    }
+                }
+                if (text === 'Soft Skills') {
+                    const parent = h3.closest('[class]');
+                    if (parent) {
+                        const allSpans = parent.querySelectorAll('*');
+                        allSpans.forEach(el => {
+                            if (el.textContent.match(/^\d+%$/)) {
+                                result.soft_skills_score = el.textContent.trim();
+                            }
+                        });
+                    }
+                }
+            });
+
+            return result;
+        }
+        """)
