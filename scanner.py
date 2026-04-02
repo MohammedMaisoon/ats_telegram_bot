@@ -290,14 +290,47 @@ class ATSScanner:
     #  FULL SCAN FLOW
     # ════════════════════════════════════════════════════════
     async def _do_scan(self, page, resume_text: str, jd_text: str) -> dict:
+        async def _fill_input(selectors, text, required=False):
+            for sel in selectors:
+                try:
+                    element = page.locator(sel).first
+                    if await element.count():
+                        await element.wait_for(state='visible', timeout=90000)
+                        await element.fill(text)
+                        await asyncio.sleep(0.3)
+                        return True
+                except Exception as e:
+                    logger.debug(f"Input fill failed for {sel}: {e}")
+            if required:
+                raise Exception(f"Could not fill required input field for selectors: {selectors}")
+            logger.warning(f"No optional input found for selectors: {selectors}")
+            return False
+
+        async def _find_editor(index):
+            candidates = [
+                page.locator('.ProseMirror'),
+                page.locator('div[contenteditable="true"]'),
+                page.locator('[role="textbox"]'),
+            ]
+            for cand in candidates:
+                try:
+                    if await cand.count() > index:
+                        editor = cand.nth(index)
+                        await editor.wait_for(state='visible', timeout=90000)
+                        return editor
+                except Exception as e:
+                    logger.debug(f"Editor candidate failed: {e}")
+            raise Exception(f"Could not find editor at index {index}")
+
+        page.set_default_timeout(90000)
+        page.set_default_navigation_timeout(120000)
+
         try:
             # ── Step 1: Click "New Scan" button in sidebar ──
-            # EXACT: button with text "New Scan" ref=e37
             try:
                 await page.wait_for_selector('button:has-text("New Scan"), a:has-text("New Scan")', timeout=90000)
                 await page.locator('button:has-text("New Scan"), a:has-text("New Scan")').first.click()
             except Exception:
-                # fallback to broader selectors
                 for sel in [
                     'button:has-text("New Scan")',
                     'a:has-text("New Scan")',
@@ -307,7 +340,7 @@ class ATSScanner:
                     'button:has-text("New scan")',
                 ]:
                     try:
-                        await page.wait_for_selector(sel, timeout=10000)
+                        await page.wait_for_selector(sel, timeout=20000)
                         await page.locator(sel).first.click()
                         break
                     except Exception:
@@ -316,19 +349,26 @@ class ATSScanner:
             logger.info("New Scan modal opened")
 
             # ── Step 2: Fill Company Name ────────────────────
-            # EXACT: input[placeholder="Amazon"] — Company Name
-            await page.locator('input[placeholder="Amazon"]').fill("Company")
-            await asyncio.sleep(0.3)
+            await _fill_input([
+                'input[placeholder="Amazon"]',
+                'input[placeholder*="Company"]',
+                'input[name*=company]',
+                'input[id*=company]',
+                'input[aria-label*="Company"]',
+            ], "Company", required=False)
 
             # ── Step 3: Fill Job Title ───────────────────────
-            # EXACT: input[placeholder="Project Manager"] — Job Title
-            await page.locator('input[placeholder="Project Manager"]').fill("Position")
-            await asyncio.sleep(0.3)
+            await _fill_input([
+                'input[placeholder="Project Manager"]',
+                'input[placeholder*="Title"]',
+                'input[placeholder*="Job"]',
+                'input[name*=title]',
+                'input[id*=title]',
+                'input[aria-label*="Job"]',
+            ], "Position", required=False)
 
             # ── Step 4: Fill Job Description ─────────────────
-            # EXACT: .ProseMirror nth=0 — rich text editor for JD
-            jd_editor = page.locator('.ProseMirror').nth(0)
-            await jd_editor.wait_for(state='visible', timeout=60000)
+            jd_editor = await _find_editor(0)
             await jd_editor.click()
             await asyncio.sleep(0.3)
             try:
@@ -339,9 +379,7 @@ class ATSScanner:
             await asyncio.sleep(0.5)
 
             # ── Step 5: Fill Resume ──────────────────────────
-            # EXACT: .ProseMirror nth=1 — rich text editor for Resume
-            resume_editor = page.locator('.ProseMirror').nth(1)
-            await resume_editor.wait_for(state='visible', timeout=60000)
+            resume_editor = await _find_editor(1)
             await resume_editor.click()
             await asyncio.sleep(0.3)
             try:
@@ -352,7 +390,6 @@ class ATSScanner:
             await asyncio.sleep(0.5)
 
             # ── Step 6: Click Scan button ────────────────────
-            # EXACT: button "Scan" exact=True (not New Scan / Create Scan)
             scan_btn = None
             for sel in [
                 'button:has-text("Scan")',
@@ -363,11 +400,11 @@ class ATSScanner:
             ]:
                 try:
                     btn = page.locator(sel).first
-                    if await btn.count() and await btn.is_visible(timeout=3000):
+                    if await btn.count() and await btn.is_visible(timeout=10000):
                         scan_btn = btn
                         break
-                except Exception:
-                    continue
+                except Exception as e:
+                    logger.debug(f"Scan button lookup failed for {sel}: {e}")
             if not scan_btn:
                 raise Exception("Could not find Scan button")
             await scan_btn.click()
@@ -375,16 +412,26 @@ class ATSScanner:
 
             # ── Step 7: Wait for results page ───────────────
             try:
-                await page.wait_for_url("**/scans/**", timeout=120000)
+                await page.wait_for_url("**/scans/**", timeout=180000)
             except Exception:
-                logger.info("Scan results URL not detected; waiting for results content...")
-                await page.wait_for_load_state("networkidle", timeout=120000)
+                logger.info("Scan results URL not detected; waiting for page load...")
+                await page.wait_for_load_state("networkidle", timeout=180000)
                 await asyncio.sleep(5)
                 if "/scans/" not in page.url:
                     logger.warning(f"Unexpected URL after scan: {page.url}")
             logger.info(f"Results page: {page.url}")
 
-            logger.info(f"Results page: {page.url}")
+            # ── Step 8: Close upgrade popup if appears ───────
+            try:
+                close_btn = page.get_by_role("button", name="Close")
+                if await close_btn.is_visible(timeout=3000):
+                    await close_btn.click()
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+            # ── Step 9: Extract everything ───────────────────
+            return await self._extract_results(page)
 
             # ── Step 8: Close upgrade popup if appears ───────
             try:
