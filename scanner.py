@@ -193,32 +193,76 @@ class ATSScanner:
     #  LOGIN (master account only)
     # ════════════════════════════════════════════════════════
     async def _login(self, page) -> bool:
-        email    = os.getenv("MASTER_EMAIL")
+        email = os.getenv("MASTER_EMAIL")
         password = os.getenv("MASTER_PASSWORD")
 
         if not email or not password:
             logger.error("MASTER_EMAIL / MASTER_PASSWORD not in .env")
             return False
 
+        async def _find_input(selectors):
+            for selector in selectors:
+                try:
+                    element = page.locator(selector).first
+                    if await element.count() and await element.is_visible(timeout=2000):
+                        return element
+                except Exception:
+                    continue
+            return None
+
         try:
             await page.goto(LOGIN_URL, wait_until="networkidle")
             await asyncio.sleep(1)
 
-            # EXACT: input[autocomplete="off"][type="text"] → email
-            await page.locator('input[autocomplete="off"][type="text"]').fill(email)
-            await asyncio.sleep(0.4)
+            email_input = await _find_input([
+                'input[type=email]',
+                'input[name*=email]',
+                'input[placeholder*="Email"]',
+                'input[placeholder*="email"]',
+                'input[autocomplete="off"][type="text"]',
+                'input[id*=email]',
+                'input[class*=email]'
+            ])
+            if not email_input:
+                email_input = page.get_by_role("textbox", name=re.compile("email", re.I))
 
-            # EXACT: input[type="password"] → password
-            await page.locator('input[type="password"]').fill(password)
-            await asyncio.sleep(0.4)
+            password_input = await _find_input([
+                'input[type=password]',
+                'input[name*=password]',
+                'input[placeholder*="Password"]',
+                'input[id*=password]',
+                'input[class*=password]'
+            ])
+            if not password_input:
+                password_input = page.get_by_role("textbox", name=re.compile("password", re.I))
 
-            # EXACT: button "Sign In"
-            await page.get_by_role("button", name="Sign In").click()
-            await page.wait_for_load_state("networkidle")
-            await asyncio.sleep(2)
+            sign_in_button = await _find_input([
+                'button:has-text("Sign In")',
+                'button:has-text("Sign in")',
+                'button:has-text("Log In")',
+                'button:has-text("Log in")',
+                'button[type=submit]'
+            ])
+            if not sign_in_button:
+                sign_in_button = page.get_by_role("button", name=re.compile("sign.*in|log.*in", re.I))
+
+            if not email_input or not password_input or not sign_in_button:
+                logger.error("Login form elements not found")
+                return False
+
+            await email_input.fill(email)
+            await asyncio.sleep(0.4)
+            await password_input.fill(password)
+            await asyncio.sleep(0.4)
+            await sign_in_button.click()
+
+            try:
+                await page.wait_for_url("**/dashboard**", timeout=30000)
+            except Exception:
+                await asyncio.sleep(3)
 
             if "login" in page.url:
-                logger.error("Login failed — check credentials")
+                logger.error("Login failed — still on login page")
                 return False
 
             logger.info("Master login successful!")
